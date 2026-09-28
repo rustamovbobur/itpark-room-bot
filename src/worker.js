@@ -63,5 +63,7 @@ export default {
     await stmt(env.DB,'DELETE FROM web_signups WHERE expires_at<?',Math.floor(Date.now()/1000)).run();
     await stmt(env.DB,'DELETE FROM web_code_requests WHERE window_end<?',Math.floor(Date.now()/1000)).run();
     await stmt(env.DB,'DELETE FROM web_links WHERE expires_at<?',Math.floor(Date.now()/1000)).run();
+    await stmt(env.DB,'DELETE FROM web_admin_sessions WHERE expires_at<?',Math.floor(Date.now()/1000)).run();
+    await stmt(env.DB,'DELETE FROM web_admin_attempts WHERE window_end<?',Math.floor(Date.now()/1000)).run();
   }
 };

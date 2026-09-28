@@ -6,6 +6,8 @@ const hash=async value=>Array.from(new Uint8Array(await crypto.subtle.digest('SH
 const error=(status,message)=>Response.json({error:message},{status,headers:{'cache-control':'no-store'}});
 const ok=(value,status=200,headers={})=>Response.json(value,{status,headers:{'cache-control':'no-store',...headers}});
 const cookie=(token,age)=>`itpark_session=${token}; HttpOnly; Secure; SameSite=Lax; Path=/api; Max-Age=${age}`;
+const adminCookie=(token,age)=>`itpark_admin=${token}; HttpOnly; Secure; SameSite=Lax; Path=/api/admin; Max-Age=${age}`;
+const adminListed=(env,id)=>String(env.ADMIN_IDS||'').split(',').map(x=>x.trim()).includes(String(id));
 const sanitize=(str,max)=>typeof str==='string'?str.trim().replace(/[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/g,' ').replace(/\s+/g,' ').slice(0,max+1):'';
 const randomToken=()=>Array.from(crypto.getRandomValues(new Uint8Array(32)),b=>b.toString(16).padStart(2,'0')).join('');
 const loginCode=()=>{const alphabet='ABCDEFGHJKLMNPQRSTUVWXYZ23456789';const bytes=crypto.getRandomValues(new Uint8Array(10));return Array.from(bytes,b=>alphabet[b%alphabet.length]).join('');};
@@ -116,9 +118,67 @@ export async function web(request,env,clock=new Date()){
   const session=token?await stmt(db,`SELECT u.id,u.name,u.department,u.authorized FROM web_sessions s JOIN users u ON u.id=s.user_id
     WHERE s.token_hash=? AND s.expires_at>?`,await hash(token),epoch).first():null;
   if(!session||!session.authorized)return error(401,'Войдите через Telegram.');
-  if(url.pathname==='/api/me'&&method==='GET')return ok({id:session.id,name:session.name,department:session.department,day:now.day,open:cfg.open,close:cfg.close,horizon:cfg.horizon,maxDuration:cfg.maxDuration});
+  if(url.pathname.startsWith('/api/admin/')){
+    if(!adminListed(env,session.id))return error(403,'Панель доступна только назначенным администраторам.');
+    if(url.pathname==='/api/admin/login'&&method==='POST'){
+      if(!env.ADMIN_PASSCODE)return error(503,'ADMIN_PASSCODE не задан в Cloudflare. Администратору нужно выполнить: npx wrangler secret put ADMIN_PASSCODE');
+      let body;try{body=await readJson(request);}catch{return error(400,'Введите код администратора.');}
+      const source=await hash('admin:'+session.id+':'+await ipKey(request));
+      await stmt(db,`INSERT INTO web_admin_attempts(source_hash,attempts,window_end) VALUES(?,1,?)
+        ON CONFLICT(source_hash) DO UPDATE SET attempts=CASE WHEN window_end<? THEN 1 ELSE attempts+1 END,
+        window_end=CASE WHEN window_end<? THEN excluded.window_end ELSE window_end END`,source,epoch+900,epoch,epoch).run();
+      const attempts=await stmt(db,'SELECT attempts FROM web_admin_attempts WHERE source_hash=?',source).first();
+      if(attempts.attempts>5)return error(429,'Слишком много попыток. Повторите через 15 минут.');
+      if(typeof body.passcode!=='string'||body.passcode!==env.ADMIN_PASSCODE)return error(401,'Неверный код администратора.');
+      const adminToken=randomToken(),digest=await hash(adminToken);
+      await db.batch([stmt(db,'INSERT INTO web_admin_sessions(token_hash,user_id,expires_at) VALUES(?,?,?)',digest,session.id,epoch+3600),stmt(db,'DELETE FROM web_admin_attempts WHERE source_hash=?',source)]);
+      return ok({ok:true},200,{'set-cookie':adminCookie(adminToken,3600)});
+    }
+    const rawAdmin=/(?:^|;\s*)itpark_admin=([a-f0-9]{64})(?:;|$)/.exec(request.headers.get('cookie')||'')?.[1];
+    const admin=rawAdmin?await stmt(db,'SELECT user_id FROM web_admin_sessions WHERE token_hash=? AND user_id=? AND expires_at>?',await hash(rawAdmin),session.id,epoch).first():null;
+    if(!admin)return error(403,'Сессия администратора истекла. Введите код ещё раз.');
+    if(url.pathname==='/api/admin/status'&&method==='GET')return ok({ok:true});
+    if(url.pathname==='/api/admin/logout'&&method==='POST'){
+      await stmt(db,'DELETE FROM web_admin_sessions WHERE token_hash=? AND user_id=?',await hash(rawAdmin),session.id).run();
+      return ok({ok:true},200,{'set-cookie':adminCookie('',0)});
+    }
+    if(url.pathname==='/api/admin/users'&&method==='GET'){
+      const users=(await db.prepare("SELECT id,name,department FROM users WHERE authorized=1 AND length(name)>0 AND length(department)>0 ORDER BY name,id LIMIT 500").all()).results;
+      return ok({users});
+    }
+    if(url.pathname==='/api/admin/bookings'&&method==='GET'){
+      const day=url.searchParams.get('day');if(!validDay(day,now,cfg.horizon))return error(400,'Дата вне доступного периода.');
+      const bookings=(await stmt(db,`SELECT b.id,b.room_id,r.name AS room_name,b.day,b.start_min,b.end_min,b.name,b.department,b.comment,b.user_id,b.created_by
+        FROM bookings b JOIN rooms r ON r.id=b.room_id WHERE b.day=? AND b.status='active' ORDER BY b.room_id,b.start_min`,day).all()).results;
+      return ok({bookings});
+    }
+    if(url.pathname==='/api/admin/book'&&method==='POST'){
+      let body;try{body=await readJson(request);}catch{return error(400,'Проверьте данные брони.');}
+      const roomId=Number(body.roomId),userId=Number(body.userId),start=Number(body.start),end=Number(body.end),day=body.day,comment=sanitize(body.comment||'',300);
+      if(!Number.isInteger(roomId)||!Number.isSafeInteger(userId)||userId<=0||!validRange(day,start,end,now,cfg)||comment.length>300)return error(400,'Проверьте сотрудника, дату и время.');
+      const owner=await stmt(db,'SELECT id,name,department FROM users WHERE id=? AND authorized=1 AND length(name)>0 AND length(department)>0',userId).first();
+      const room=await stmt(db,'SELECT id FROM rooms WHERE id=? AND active=1',roomId).first();
+      if(!owner||!room)return error(400,'Сотрудник или комната недоступны.');
+      try{
+        await stmt(db,`INSERT INTO bookings(id,user_id,room_id,day,start_min,end_min,name,department,comment,created_at,created_by)
+          VALUES(?,?,?,?,?,?,?,?,?,?,?)`,crypto.randomUUID(),owner.id,roomId,day,start,end,owner.name,owner.department,comment,epoch,session.id).run();
+        return ok({ok:true},201);
+      }catch(e){if(/booking_slots|UNIQUE|constraint/i.test(String(e.message)))return error(409,'Это время уже занято. Обновите расписание.');throw e;}
+    }
+    if(url.pathname==='/api/admin/cancel'&&method==='POST'){
+      let body;try{body=await readJson(request);}catch{return error(400,'Неверный запрос.');}
+      if(typeof body.id!=='string'||!/^[-0-9a-f]{36}$/.test(body.id))return error(400,'Неверный ID брони.');
+      const result=await stmt(db,`UPDATE bookings SET status='cancelled',cancelled_by=?,cancelled_at=?
+        WHERE id=? AND status='active' AND (day>? OR (day=? AND end_min>?))`,session.id,epoch,body.id,now.day,now.day,now.minute).run();
+      if(!result.meta?.changes)return error(404,'Бронь не найдена или уже отменена.');
+      return ok({ok:true});
+    }
+    return error(404,'Страница не найдена.');
+  }
+  if(url.pathname==='/api/me'&&method==='GET')return ok({id:session.id,name:session.name,department:session.department,adminEligible:adminListed(env,session.id),day:now.day,open:cfg.open,close:cfg.close,horizon:cfg.horizon,maxDuration:cfg.maxDuration});
   if(url.pathname==='/api/logout'&&method==='POST'){
     await stmt(db,'DELETE FROM web_sessions WHERE token_hash=?',await hash(token)).run();
+    await stmt(db,'DELETE FROM web_admin_sessions WHERE user_id=?',session.id).run();
     return ok({ok:true},200,{'set-cookie':cookie('',0)});
   }
   if(url.pathname==='/api/schedule'&&method==='GET'){

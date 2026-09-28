@@ -9,13 +9,13 @@ import {client} from '../src/site.js';
 const NOW=new Date('2026-09-28T04:00:00Z'),BASE='https://test.example';
 const req=(path,method='GET',body,cookie,origin=BASE)=>new Request(BASE+path,{method,headers:{...(method==='POST'?{'content-type':'application/json',origin}:{}),...(cookie?{cookie}:{})},body:body?JSON.stringify(body):undefined});
 async function setup(){const mf=new Miniflare(convertV4MiniflareOptions({modules:true,script:'export default {fetch(){return new Response("ok")}}',d1Databases:['DB'],compatibilityDate:'2026-09-01'}));
- const db=await mf.getD1Database('DB');for(const name of ['0001_initial.sql','0002_web.sql','0003_site_signup.sql','0004_site_links.sql']){
+ const db=await mf.getD1Database('DB');for(const name of ['0001_initial.sql','0002_web.sql','0003_site_signup.sql','0004_site_links.sql','0005_site_admin.sql']){
   const schema=readFileSync(new URL('../migrations/'+name,import.meta.url),'utf8');
-  const statements=schema.replace(/^--.*$/gm,'').split(/;\s*(?=CREATE |INSERT |$)/).map(s=>s.trim()).filter(Boolean);
+  const statements=schema.replace(/^--.*$/gm,'').split(/;\s*(?=CREATE |INSERT |ALTER |$)/).map(s=>s.trim()).filter(Boolean);
   for(const s of statements)await db.prepare(s.replace(/\n/g,' ')).run();
  }
  await db.prepare("INSERT INTO users(id,authorized,name,department) VALUES(42,1,'Бобур','Аналитика')").run();
- return {mf,db,env:{DB:db,STAFF_ACCESS_CODE:'staff',BOT_TOKEN:'test',WEBHOOK_SECRET:'secret'}};
+ return {mf,db,env:{DB:db,STAFF_ACCESS_CODE:'staff',BOT_TOKEN:'test',WEBHOOK_SECRET:'secret',ADMIN_IDS:'42',ADMIN_PASSCODE:'example-admin-pass'}};
 }
 const handle=(env,path,method='GET',body,cookie,when=NOW,origin=BASE)=>web(req(path,method,body,cookie,origin),env,when);
 async function loginCode(env){const response=await processUpdate(env,{update_id:100,message:{text:'/web',from:{id:42},chat:{id:42,type:'private'}}},NOW);return response.text.match(/[A-Z2-9]{10}/)[0];}
@@ -108,6 +108,34 @@ test('web and bot share the same schedule and prevent overlap; owner cancellatio
   assert.equal((await handle(env,'/api/cancel','POST',{id:mine.bookings[0].id},cookie)).status,404);
  }finally{await mf.dispose();}
 });
+test('website admin requires allowlisted Telegram identity and passcode; books for staff and audits cancellation',async()=>{
+ const {mf,db,env}=await setup();try{
+  await db.prepare("INSERT INTO users(id,authorized,name,department) VALUES(99,1,'Мария','Инвестиции')").run();
+  const code=await loginCode(env),webCookie=(await handle(env,'/api/login','POST',{code})).headers.get('set-cookie');
+  assert.equal((await handle(env,'/api/admin/users','GET',null,webCookie)).status,403);
+  assert.equal((await handle(env,'/api/admin/login','POST',{passcode:'wrong'},webCookie)).status,401);
+  const noSecret={...env,ADMIN_PASSCODE:''};
+  assert.equal((await handle(noSecret,'/api/admin/login','POST',{passcode:'example-admin-pass'},webCookie)).status,503);
+  const noId={...env,ADMIN_IDS:'99'};
+  assert.equal((await handle(noId,'/api/admin/login','POST',{passcode:'example-admin-pass'},webCookie)).status,403);
+  const login=await handle(env,'/api/admin/login','POST',{passcode:'example-admin-pass'},webCookie);
+  assert.equal(login.status,200);assert.match(login.headers.get('set-cookie'),/HttpOnly/);
+  const both=webCookie+'; '+login.headers.get('set-cookie');
+  const users=await (await handle(env,'/api/admin/users','GET',null,both)).json();assert.equal(users.users.length,2);
+  const booking={userId:99,roomId:5,day:'2026-09-29',start:600,end:660,comment:'Встреча'};
+  assert.equal((await handle(env,'/api/admin/book','POST',booking,both)).status,201);
+  assert.equal((await handle(env,'/api/admin/book','POST',{...booking,start:630,end:690},both)).status,409);
+  const row=await db.prepare("SELECT id,user_id,name,department,created_by FROM bookings WHERE status='active'").first();
+  assert.deepEqual([row.user_id,row.name,row.department,row.created_by],[99,'Мария','Инвестиции',42]);
+  assert.equal((await handle(env,'/api/admin/cancel','POST',{id:row.id},webCookie)).status,403);
+  assert.equal((await handle(env,'/api/admin/cancel','POST',{id:row.id},both,NOW,'https://evil.example')).status,403);
+  assert.equal((await handle(env,'/api/admin/cancel','POST',{id:row.id},both)).status,200);
+  assert.equal((await db.prepare('SELECT cancelled_by FROM bookings WHERE id=?').bind(row.id).first()).cancelled_by,42);
+  assert.equal((await db.prepare('SELECT count(*) AS n FROM booking_slots').first()).n,0);
+  assert.equal((await handle(env,'/api/admin/logout','POST',{},both)).status,200);
+  assert.equal((await handle(env,'/api/admin/status','GET',null,both)).status,403);
+ }finally{await mf.dispose();}
+});
 test('site updates profile and rejects cross-origin writes or dates outside horizon',async()=>{
  const {mf,db,env}=await setup();try{
   const code=await loginCode(env),cookie=(await handle(env,'/api/login','POST',{code})).headers.get('set-cookie');
@@ -123,6 +151,8 @@ test('worker serves an actual booking app, without injecting user values into HT
   new Function(client);
   const page=await worker.fetch(req('/'),env),html=await page.text();
   assert.equal(page.status,200);assert.match(html,/Расписание/);assert.match(html,/booking-form/);
+  assert.match(html,/id="admin-entry"/);assert.match(html,/src="\/brand.png"/);
+  assert.doesNotMatch(html,/<footer class="site-credit">/);
   assert.match(page.headers.get('content-security-policy'),/frame-ancestors/);
   assert.equal((await worker.fetch(req('/site.js'),env)).status,200);
   assert.equal((await worker.fetch(req('/site.css'),env)).status,200);
