@@ -9,7 +9,7 @@ import {client} from '../src/site.js';
 const NOW=new Date('2026-09-28T04:00:00Z'),BASE='https://test.example';
 const req=(path,method='GET',body,cookie,origin=BASE)=>new Request(BASE+path,{method,headers:{...(method==='POST'?{'content-type':'application/json',origin}:{}),...(cookie?{cookie}:{})},body:body?JSON.stringify(body):undefined});
 async function setup(){const mf=new Miniflare(convertV4MiniflareOptions({modules:true,script:'export default {fetch(){return new Response("ok")}}',d1Databases:['DB'],compatibilityDate:'2026-09-01'}));
- const db=await mf.getD1Database('DB');for(const name of ['0001_initial.sql','0002_web.sql','0003_site_signup.sql']){
+ const db=await mf.getD1Database('DB');for(const name of ['0001_initial.sql','0002_web.sql','0003_site_signup.sql','0004_site_links.sql']){
   const schema=readFileSync(new URL('../migrations/'+name,import.meta.url),'utf8');
   const statements=schema.replace(/^--.*$/gm,'').split(/;\s*(?=CREATE |INSERT |$)/).map(s=>s.trim()).filter(Boolean);
   for(const s of statements)await db.prepare(s.replace(/\n/g,' ')).run();
@@ -57,6 +57,30 @@ test('site signup needs employee code and Telegram-delivered one-time proof; reg
   const another=delivered.text.match(/[A-Z2-9]{10}/)[0];
   assert.equal((await handle(env,'/api/login','POST',{code:another})).status,200);
  }finally{globalThis.fetch=original;await mf.dispose();}
+});
+test('Telegram link registers a new user without entering their ID and works once',async()=>{
+ const {mf,db,env}=await setup();try{
+  const result=await processUpdate(env,{update_id:200,message:{text:'/start site',from:{id:12345},chat:{id:12345,type:'private'}}},NOW);
+  const token=result.reply_markup.inline_keyboard[0][0].url.match(/#login=([a-f0-9]{64})$/)[1];
+  assert.equal((await handle(env,'/api/link','POST',{token})).status,202);
+  assert.equal((await handle(env,'/api/link','POST',{token,register:true,name:'Мария',department:'Отдел',staffCode:'wrong'})).status,400);
+  assert.equal((await db.prepare('SELECT authorized FROM users WHERE id=12345').first()).authorized,0);
+  const body={token,register:true,name:'Мария',department:'Отдел',staffCode:'staff'};
+  const [first,second]=await Promise.all([handle(env,'/api/link','POST',body),handle(env,'/api/link','POST',body)]);
+  assert.deepEqual([first.status,second.status].sort(),[200,401]);
+  const good=first.status===200?first:second;
+  const me=await (await handle(env,'/api/me','GET',null,good.headers.get('set-cookie'))).json();
+  assert.deepEqual([me.id,me.name,me.department],[12345,'Мария','Отдел']);
+  assert.equal((await handle(env,'/api/link','POST',{token})).status,401);
+ }finally{await mf.dispose();}
+});
+test('existing bot user opens website from one Telegram link without signup',async()=>{
+ const {mf,env}=await setup();try{
+  const result=await processUpdate(env,{update_id:201,message:{text:'/site',from:{id:42},chat:{id:42,type:'private'}}},NOW);
+  const token=result.reply_markup.inline_keyboard[0][0].url.match(/#login=([a-f0-9]{64})$/)[1];
+  const login=await handle(env,'/api/link','POST',{token});assert.equal(login.status,200);
+  assert.equal((await (await handle(env,'/api/me','GET',null,login.headers.get('set-cookie'))).json()).id,42);
+ }finally{await mf.dispose();}
 });
 test('site cannot register or log in using an ID when the bot cannot reach its owner',async()=>{
  const {mf,db,env}=await setup(),original=globalThis.fetch;

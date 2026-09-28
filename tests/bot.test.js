@@ -9,7 +9,7 @@ import worker from '../src/worker.js';
 // SQLite adapter with transaction semantics matching D1.batch. The app's actual
 // SQL and triggers run unchanged, rather than replacing booking logic with mocks.
 class DB {
-  constructor(){this.sql=new DatabaseSync(':memory:');this.sql.exec('PRAGMA foreign_keys=ON');this.sql.exec(readFileSync(new URL('../migrations/0001_initial.sql',import.meta.url),'utf8'));}
+  constructor(){this.sql=new DatabaseSync(':memory:');this.sql.exec('PRAGMA foreign_keys=ON');for(const name of ['0001_initial.sql','0004_site_links.sql'])this.sql.exec(readFileSync(new URL('../migrations/'+name,import.meta.url),'utf8'));}
   prepare(sql){const db=this; return {args:[],bind(...args){this.args=args;return this;},async first(){return db.sql.prepare(sql).get(...this.args)||null;},async all(){return {results:db.sql.prepare(sql).all(...this.args)};},async run(){return db.sql.prepare(sql).run(...this.args);}, execute(){return db.sql.prepare(sql).run(...this.args);}};}
   async batch(statements){this.sql.exec('BEGIN IMMEDIATE');try{const result=statements.map(s=>s.execute());this.sql.exec('COMMIT');return result;}catch(e){this.sql.exec('ROLLBACK');throw e;}}
 }
@@ -41,6 +41,13 @@ test('schedule keeps its mode when selecting another day',async()=>{
  const next=await click(env,1,'day','2026-09-30');
  assert.match(next.text,/Свободно:/);
  assert.doesNotMatch(next.text,/Выберите начало/);
+});
+test('new user gets a website link without registering inside the bot',async()=>{
+ const env=setup(),response=await send(env,101,'/start site');
+ assert.match(response.text,/регистрироваться не нужно/);
+ assert.match(response.reply_markup.inline_keyboard[0][0].url,/#login=[a-f0-9]{64}$/);
+ assert.equal(rows(env,'SELECT authorized FROM users WHERE id=101')[0].authorized,0);
+ assert.equal(rows(env,'SELECT count(*) AS n FROM web_links')[0].n,1);
 });
 test('25 concurrent users: exactly one success, no orphan booking or partial slots',async()=>{
  const env=setup();for(let id=1;id<=25;id++){await register(env,id);await prepare(env,id);}

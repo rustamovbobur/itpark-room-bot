@@ -157,6 +157,15 @@ export async function plan(env, user, update, nowDate = new Date()) {
     if((page+1)*8<count.n)nav.push(b('Далее →','admin_users',page+1));
     return reply(`👥 Сотрудники · всего ${count.n}\nСтраница ${page+1}\n\n`+rows.map(x=>`${x.name||'Профиль не заполнен'}\n${x.department||'Отдел не указан'}\nTelegram ID: ${x.id}`).join('\n\n'),[...(nav.length?[nav]:[]),adminBack(),home]);
   };
+  if(text==='/site'||text==='/website'||text==='/start site') {
+    const token=Array.from(crypto.getRandomValues(new Uint8Array(32)),x=>x.toString(16).padStart(2,'0')).join('');
+    const digest=Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256',new TextEncoder().encode(token)))).map(x=>x.toString(16).padStart(2,'0')).join('');
+    mutations.push(stmt(db,'DELETE FROM web_links WHERE user_id=?',user.id));
+    mutations.push(stmt(db,'INSERT INTO web_links(token_hash,user_id,expires_at) VALUES(?,?,?)',digest,user.id,epoch+600));
+    return reply('🌐 Нажмите кнопку ниже, чтобы открыть Meeting Rooms. Ссылка действует 10 минут и только один раз.\n\nЕсли вы ещё не регистрировались, укажите имя, отдел и код доступа сотрудников уже на сайте. В боте регистрироваться не нужно.',[
+      [{text:'Открыть Meeting Rooms',url:`https://itpark-room-bot.itpark.workers.dev/#login=${token}`}]
+    ]);
+  }
   if(text==='/web' && authorized && name && department) {
     const alphabet='ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
     const random=new Uint8Array(10);crypto.getRandomValues(random);
@@ -171,7 +180,7 @@ export async function plan(env, user, update, nowDate = new Date()) {
     if(listedAdmin) { authorized=1; move('name'); return reply('Добро пожаловать! Напишите ваше имя и фамилию.',[]); }
     const attempts=state.attempts||0, until=state.until||0;
     if(until>epoch && attempts>=5) return reply('Слишком много попыток. Повторите через 15 минут.',[]);
-    if(!text || text.startsWith('/')) return reply('🏢 Meeting Rooms IT Park\n\nВведите код доступа сотрудников. Его можно получить у ответственного за переговорные.\nИмя, отдел и комментарий к брони будут видны другим сотрудникам.',[]);
+    if(!text || text.startsWith('/')) return reply('🏢 Meeting Rooms IT Park\n\nДля сайта отправьте /site — регистрация в боте не требуется.\n\nЧтобы бронировать прямо в боте, введите код доступа сотрудников. Его можно получить у ответственного за комнаты.',[]);
     if(text!==env.STAFF_ACCESS_CODE) {
       state={step:'access',attempts:until>epoch?attempts+1:1,until:until>epoch?until:epoch+900};
       return reply('Код не подошёл. Проверьте его у ответственного за переговорные.',[]);

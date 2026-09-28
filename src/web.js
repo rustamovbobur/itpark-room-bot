@@ -20,6 +20,30 @@ const ipKey=async request=>hash(request.headers.get('cf-connecting-ip')||'unknow
 export async function web(request,env,clock=new Date()){
   const url=new URL(request.url),method=request.method,db=env.DB,epoch=Math.floor(clock.getTime()/1000),now=localNow(clock),cfg=config(env);
   if(method==='POST' && request.headers.get('origin')!==url.origin)return error(403,'Обновите страницу и попробуйте ещё раз.');
+  if(url.pathname==='/api/link'&&method==='POST'){
+    let body;try{body=await readJson(request);}catch{return error(400,'Неверная ссылка. Запросите новую командой /site.');}
+    if(typeof body.token!=='string'||!(/^[a-f0-9]{64}$/.test(body.token)))return error(400,'Неверная ссылка. Запросите новую командой /site.');
+    const digest=await hash(body.token);
+    const link=await stmt(db,`SELECT l.user_id,u.authorized,u.name,u.department FROM web_links l JOIN users u ON u.id=l.user_id
+      WHERE l.token_hash=? AND l.expires_at>?`,digest,epoch).first();
+    if(!link)return error(401,'Ссылка устарела или уже использована. Отправьте боту /site ещё раз.');
+    const registered=link.authorized && link.name && link.department;
+    if(!registered && body.register!==true)return ok({needsProfile:true},202);
+    const name=sanitize(body.name,80),department=sanitize(body.department,100);
+    if(!registered && (!env.STAFF_ACCESS_CODE||body.staffCode!==env.STAFF_ACCESS_CODE||name.length<2||name.length>80||department.length<2||department.length>100))
+      return error(400,'Проверьте имя, отдел и код доступа сотрудников у ответственного.');
+    const token=randomToken(),tokenHash=await hash(token);
+    try{
+      await db.batch([
+        stmt(db,'DELETE FROM web_links WHERE token_hash=? AND expires_at>?',digest,epoch),
+        db.prepare('INSERT INTO state_guard(ok) VALUES(changes())'),
+        db.prepare('DELETE FROM state_guard'),
+        ...(!registered?[stmt(db,'UPDATE users SET authorized=1,name=?,department=? WHERE id=? AND (authorized=0 OR length(name)=0 OR length(department)=0)',name,department,link.user_id)]:[]),
+        stmt(db,'INSERT INTO web_sessions(token_hash,user_id,expires_at,created_at) VALUES(?,?,?,?)',tokenHash,link.user_id,epoch+30*86400,epoch)
+      ]);
+      return ok({ok:true},200,{'set-cookie':cookie(token,30*86400)});
+    }catch{return error(401,'Ссылка уже использована. Отправьте боту /site ещё раз.');}
+  }
   if(url.pathname==='/api/request-code'&&method==='POST'){
     let body;try{body=await readJson(request);}catch{return error(400,'Проверьте данные формы.');}
     const id=Number(body.telegramId),signup=body.signup===true;
