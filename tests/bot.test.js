@@ -9,7 +9,7 @@ import worker from '../src/worker.js';
 // SQLite adapter with transaction semantics matching D1.batch. The app's actual
 // SQL and triggers run unchanged, rather than replacing booking logic with mocks.
 class DB {
-  constructor(){this.sql=new DatabaseSync(':memory:');this.sql.exec('PRAGMA foreign_keys=ON');for(const name of ['0001_initial.sql','0004_site_links.sql'])this.sql.exec(readFileSync(new URL('../migrations/'+name,import.meta.url),'utf8'));}
+  constructor(){this.sql=new DatabaseSync(':memory:');this.sql.exec('PRAGMA foreign_keys=ON');for(const name of ['0001_initial.sql','0002_web.sql','0003_site_signup.sql','0004_site_links.sql','0005_site_admin.sql'])this.sql.exec(readFileSync(new URL('../migrations/'+name,import.meta.url),'utf8'));}
   prepare(sql){const db=this; return {args:[],bind(...args){this.args=args;return this;},async first(){return db.sql.prepare(sql).get(...this.args)||null;},async all(){return {results:db.sql.prepare(sql).all(...this.args)};},async run(){return db.sql.prepare(sql).run(...this.args);}, execute(){return db.sql.prepare(sql).run(...this.args);}};}
   async batch(statements){this.sql.exec('BEGIN IMMEDIATE');try{const result=statements.map(s=>s.execute());this.sql.exec('COMMIT');return result;}catch(e){this.sql.exec('ROLLBACK');throw e;}}
 }

@@ -1,4 +1,7 @@
-# Переговорные IT Park — сайт и Telegram-бот
+# IT Park Meeting Rooms — сайт и Telegram-бот
+
+Последняя проверка и исправления: [AUDIT_REPORT_RU.md](AUDIT_REPORT_RU.md). Установка: [AUDIT_UPDATE_RU.md](AUDIT_UPDATE_RU.md).
+
 
 В проекте есть сайт Meeting Rooms для бронирования с ноутбука: https://itpark-room-bot.itpark.workers.dev/ . Последняя инструкция по панели администратора и устранению ошибки `/admin`: [ADMIN_SITE_UPDATE_RU.md](ADMIN_SITE_UPDATE_RU.md). Расписание и брони общие с Telegram-ботом.
 

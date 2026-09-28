@@ -159,3 +159,65 @@ test('worker serves an actual booking app, without injecting user values into HT
   const brand=await worker.fetch(req('/brand.png'),env);assert.equal(brand.status,200);assert.equal(brand.headers.get('content-type'),'image/png');
  }finally{await mf.dispose();}
 });
+
+test('malformed JSON shapes are rejected without throwing',async()=>{
+ const {mf,env}=await setup();try{
+  for(const path of ['/api/login','/api/link','/api/request-code'])for(const body of ['null','[]','42','"text"']){
+   const response=await web(new Request(BASE+path,{method:'POST',headers:{origin:BASE,'content-type':'application/json'},body}),env,NOW);
+   assert.equal(response.status,400,path+' '+body);
+  }
+ }finally{await mf.dispose();}
+});
+test('web profile edit invalidates a bot snapshot so it cannot overwrite the edit',async()=>{
+ const {mf,db,env}=await setup();try{
+  const code=await loginCode(env),cookie=(await handle(env,'/api/login','POST',{code})).headers.get('set-cookie');
+  const before=await db.prepare('SELECT version FROM users WHERE id=42').first();
+  assert.equal((await handle(env,'/api/profile','POST',{name:'Новое имя',department:'Новый отдел'},cookie)).status,200);
+  const stale=await db.prepare("UPDATE users SET name='Старое имя' WHERE id=42 AND version=?").bind(before.version).run();
+  assert.equal(stale.meta.changes,0);
+  assert.equal((await db.prepare('SELECT name FROM users WHERE id=42').first()).name,'Новое имя');
+ }finally{await mf.dispose();}
+});
+test('employee-code guesses are limited across newly issued Telegram links',async()=>{
+ const {mf,env}=await setup();try{
+  for(let attempt=0;attempt<6;attempt++){
+   const response=await processUpdate(env,{update_id:300+attempt,message:{text:'/site',from:{id:123},chat:{id:123,type:'private'}}},NOW);
+   const token=response.reply_markup.inline_keyboard[0][0].url.split('#login=')[1];
+   const result=await handle(env,'/api/link','POST',{token,register:true,name:'Имя',department:'Отдел',staffCode:'wrong'});
+   assert.equal(result.status,attempt<5?400:429);
+  }
+ }finally{await mf.dispose();}
+});
+test('20 simultaneous website users compete for one overlapping interval',async()=>{
+ const {mf,db,env}=await setup();try{
+  const requests=[];
+  for(let id=1000;id<1020;id++){
+   const token=id.toString(16).padStart(64,'0');
+   const digest=Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256',new TextEncoder().encode(token))),x=>x.toString(16).padStart(2,'0')).join('');
+   await db.prepare("INSERT INTO users(id,authorized,name,department) VALUES(?,1,'Имя','Отдел')").bind(id).run();
+   await db.prepare('INSERT INTO web_sessions VALUES(?,?,?,?)').bind(digest,id,Math.floor(NOW.getTime()/1000)+3600,1).run();
+   requests.push(req('/api/book','POST',{roomId:5,day:'2026-09-29',start:600,end:720},'itpark_session='+token));
+  }
+  const results=await Promise.all(requests.map(r=>web(r,env,NOW)));
+  assert.equal(results.filter(r=>r.status===201).length,1);assert.equal(results.filter(r=>r.status===409).length,19);
+  assert.equal((await db.prepare('SELECT count(*) AS n FROM bookings').first()).n,1);
+  assert.equal((await db.prepare('SELECT count(*) AS n FROM booking_slots').first()).n,4);
+ }finally{await mf.dispose();}
+});
+test('admin password lockout survives IP changes and admin sessions expire after one hour',async()=>{
+ const {mf,env}=await setup();try{
+  const code=await loginCode(env),cookie=(await handle(env,'/api/login','POST',{code})).headers.get('set-cookie');
+  const login=await handle(env,'/api/admin/login','POST',{passcode:env.ADMIN_PASSCODE},cookie),both=cookie+'; '+login.headers.get('set-cookie');
+  assert.equal((await handle(env,'/api/admin/status','GET',null,both,new Date(NOW.getTime()+3600001))).status,403);
+  for(let i=0;i<6;i++){
+   const r=req('/api/admin/login','POST',{passcode:'wrong'},cookie);r.headers.set('cf-connecting-ip','192.0.2.'+i);
+   assert.equal((await web(r,env,NOW)).status,i<5?401:429);
+  }
+ }finally{await mf.dispose();}
+});
+test('API failures return safe JSON, and readiness detects incomplete schema',async()=>{
+ const broken={DB:{prepare(){throw new Error('database credentials must not leak');}}};
+ assert.equal((await worker.fetch(req('/health'),broken)).status,503);
+ const result=await worker.fetch(req('/api/me','GET',null,'itpark_session='+'a'.repeat(64)),broken);
+ assert.equal(result.status,503);assert.doesNotMatch(await result.text(),/credentials/);
+});

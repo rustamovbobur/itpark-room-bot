@@ -1,5 +1,6 @@
 import {spawnSync} from 'node:child_process';
 const keys=['BOT_TOKEN','WEBHOOK_SECRET','STAFF_ACCESS_CODE'];
+if(process.env.ADMIN_PASSCODE)keys.push('ADMIN_PASSCODE');
 const secrets=Object.fromEntries(keys.map(k=>[k,process.env[k]]));
 for(const key of keys) if(!secrets[key]||/PASTE_|REPLACE_/.test(secrets[key])) throw new Error('Заполните '+key+' в .dev.vars');
 if(!/^\d+:[A-Za-z0-9_-]+$/.test(secrets.BOT_TOKEN)) throw new Error('Неверный формат BOT_TOKEN');

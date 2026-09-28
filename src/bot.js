@@ -18,8 +18,8 @@ export async function plan(env, user, update, nowDate = new Date()) {
   const mutations=[];
   const listedAdmin=String(env.ADMIN_IDS||'').split(',').map(x=>x.trim()).includes(String(user.id));
   let admin=listedAdmin && (state.adminUntil||0)>epoch;
-  const text=update.message?.text?.trim() || '';
-  const cb=update.callback_query?.data || '';
+  const text=typeof update.message?.text==='string'?update.message.text.trim():'';
+  const cb=typeof update.callback_query?.data==='string'?update.callback_query.data:'';
   const move=(step, data={}) => {state={adminUntil:state.adminUntil||0,adminAttempts:state.adminAttempts||0,adminRetryAt:state.adminRetryAt||0,step,nonce:nonce(),expires:epoch+3600,...data};};
   const b=(label, action, value='') => button(label,`b:${state.nonce}:${action}:${value}`);
   const reply=(message,keyboard=menu()) => ({user:{authorized,name,department,state},mutations,
@@ -300,9 +300,10 @@ export async function plan(env, user, update, nowDate = new Date()) {
 // State, reservation and response are committed together. Telegram retries cannot
 // create another booking; optimistic state checks also protect simultaneous clicks.
 export async function processUpdate(env, update, now = new Date()) {
+  if(!update||typeof update!=='object'||Array.isArray(update))return null;
   const source=update.callback_query?.message || update.message;
   const from=update.callback_query?.from || update.message?.from;
-  if(!source || source.chat?.type!=='private' || !from || from.is_bot || source.chat.id!==from.id || !Number.isSafeInteger(update.update_id)) return null;
+  if(!source || source.chat?.type!=='private' || !from || from.is_bot || !Number.isSafeInteger(from.id)||from.id<=0 || source.chat.id!==from.id || !Number.isSafeInteger(update.update_id)) return null;
   const db=env.DB,id=from.id;
   await stmt(db,'INSERT OR IGNORE INTO users(id) VALUES(?)',id).run();
   for(let attempt=0;attempt<6;attempt++) {

@@ -14,8 +14,12 @@ const loginCode=()=>{const alphabet='ABCDEFGHJKLMNPQRSTUVWXYZ23456789';const byt
 const readJson=async request=>{
   if(!(request.headers.get('content-type')||'').toLowerCase().startsWith('application/json'))throw new Error('type');
   if(Number(request.headers.get('content-length'))>4096)throw new Error('size');
-  const value=await request.text();if(value.length>4096)throw new Error('size');
-  return JSON.parse(value);
+  const reader=request.body?.getReader();if(!reader)throw new Error('body');
+  const decoder=new TextDecoder();let value='',size=0;
+  while(true){const {value:chunk,done}=await reader.read();if(done)break;size+=chunk.byteLength;if(size>4096){await reader.cancel();throw new Error('size');}value+=decoder.decode(chunk,{stream:true});}
+  value+=decoder.decode();const parsed=JSON.parse(value);
+  if(!parsed||typeof parsed!=='object'||Array.isArray(parsed))throw new Error('object');
+  return parsed;
 };
 const ipKey=async request=>hash(request.headers.get('cf-connecting-ip')||'unknown');
 
@@ -31,6 +35,13 @@ export async function web(request,env,clock=new Date()){
     if(!link)return error(401,'Ссылка устарела или уже использована. Отправьте боту /site ещё раз.');
     const registered=link.authorized && link.name && link.department;
     if(!registered && body.register!==true)return ok({needsProfile:true},202);
+    if(!registered){
+      const key=await hash('signup:'+link.user_id);
+      await stmt(db,`INSERT INTO web_code_requests(source_hash,attempts,window_end) VALUES(?,1,?)
+        ON CONFLICT(source_hash) DO UPDATE SET attempts=CASE WHEN window_end<? THEN 1 ELSE attempts+1 END,
+        window_end=CASE WHEN window_end<? THEN excluded.window_end ELSE window_end END`,key,epoch+900,epoch,epoch).run();
+      if((await stmt(db,'SELECT attempts FROM web_code_requests WHERE source_hash=?',key).first()).attempts>5)return error(429,'Слишком много попыток. Повторите через 15 минут.');
+    }
     const name=sanitize(body.name,80),department=sanitize(body.department,100);
     if(!registered && (!env.STAFF_ACCESS_CODE||body.staffCode!==env.STAFF_ACCESS_CODE||name.length<2||name.length>80||department.length<2||department.length>100))
       return error(400,'Проверьте имя, отдел и код доступа сотрудников у ответственного.');
@@ -40,7 +51,7 @@ export async function web(request,env,clock=new Date()){
         stmt(db,'DELETE FROM web_links WHERE token_hash=? AND expires_at>?',digest,epoch),
         db.prepare('INSERT INTO state_guard(ok) VALUES(changes())'),
         db.prepare('DELETE FROM state_guard'),
-        ...(!registered?[stmt(db,'UPDATE users SET authorized=1,name=?,department=? WHERE id=? AND (authorized=0 OR length(name)=0 OR length(department)=0)',name,department,link.user_id)]:[]),
+        ...(!registered?[stmt(db,`UPDATE users SET authorized=1,name=?,department=?,version=version+1,state='{"step":"home"}' WHERE id=? AND (authorized=0 OR length(name)=0 OR length(department)=0)`,name,department,link.user_id)]:[]),
         stmt(db,'INSERT INTO web_sessions(token_hash,user_id,expires_at,created_at) VALUES(?,?,?,?)',tokenHash,link.user_id,epoch+30*86400,epoch)
       ]);
       return ok({ok:true},200,{'set-cookie':cookie(token,30*86400)});
@@ -101,7 +112,7 @@ export async function web(request,env,clock=new Date()){
         db.prepare('INSERT INTO state_guard(ok) VALUES(changes())'),
         db.prepare('DELETE FROM state_guard'),
         stmt(db,'INSERT INTO users(id) VALUES(?) ON CONFLICT(id) DO NOTHING',pending.user_id),
-        stmt(db,'UPDATE users SET authorized=1,name=?,department=? WHERE id=? AND (authorized=0 OR length(name)=0 OR length(department)=0)',pending.name,pending.department,pending.user_id),
+        stmt(db,`UPDATE users SET authorized=1,name=?,department=?,version=version+1,state='{"step":"home"}' WHERE id=? AND (authorized=0 OR length(name)=0 OR length(department)=0)`,pending.name,pending.department,pending.user_id),
         stmt(db,'INSERT INTO web_sessions(token_hash,user_id,expires_at,created_at) VALUES(?,?,?,?)',tokenHash,pending.user_id,epoch+30*86400,epoch),
         stmt(db,'DELETE FROM web_login_attempts WHERE source_hash=?',source)
       ]:[
@@ -123,7 +134,7 @@ export async function web(request,env,clock=new Date()){
     if(url.pathname==='/api/admin/login'&&method==='POST'){
       if(!env.ADMIN_PASSCODE)return error(503,'ADMIN_PASSCODE не задан в Cloudflare. Администратору нужно выполнить: npx wrangler secret put ADMIN_PASSCODE');
       let body;try{body=await readJson(request);}catch{return error(400,'Введите код администратора.');}
-      const source=await hash('admin:'+session.id+':'+await ipKey(request));
+      const source=await hash('admin:'+session.id);
       await stmt(db,`INSERT INTO web_admin_attempts(source_hash,attempts,window_end) VALUES(?,1,?)
         ON CONFLICT(source_hash) DO UPDATE SET attempts=CASE WHEN window_end<? THEN 1 ELSE attempts+1 END,
         window_end=CASE WHEN window_end<? THEN excluded.window_end ELSE window_end END`,source,epoch+900,epoch,epoch).run();
@@ -197,7 +208,7 @@ export async function web(request,env,clock=new Date()){
     let body;try{body=await readJson(request);}catch{return error(400,'Проверьте введённые данные.');}
     const name=sanitize(body.name,80),department=sanitize(body.department,100);
     if(name.length<2||name.length>80||department.length<2||department.length>100)return error(400,'Имя и отдел: минимум 2 символа; максимум 80 и 100 соответственно.');
-    await stmt(db,'UPDATE users SET name=?,department=? WHERE id=? AND authorized=1',name,department,session.id).run();
+    await stmt(db,'UPDATE users SET name=?,department=?,version=version+1 WHERE id=? AND authorized=1',name,department,session.id).run();
     return ok({name,department});
   }
   if(url.pathname==='/api/book'&&method==='POST'){

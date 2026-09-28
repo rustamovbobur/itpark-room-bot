@@ -7,7 +7,7 @@ export function addDays(day, amount) {
   return new Date(Date.parse(day + 'T00:00:00Z') + amount * 86400000).toISOString().slice(0, 10);
 }
 export function validDay(day, now, horizon) {
-  return /^\d{4}-\d{2}-\d{2}$/.test(day) && !Number.isNaN(Date.parse(day + 'T00:00:00Z')) &&
+  return typeof day==='string' && /^\d{4}-\d{2}-\d{2}$/.test(day) && !Number.isNaN(Date.parse(day + 'T00:00:00Z')) &&
     new Date(day + 'T00:00:00Z').toISOString().slice(0, 10) === day &&
     day >= now.day && day < addDays(now.day, horizon);
 }
