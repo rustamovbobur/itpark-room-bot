@@ -16,10 +16,11 @@ export async function plan(env, user, update, nowDate = new Date()) {
   const db=env.DB, cfg=config(env), now=localNow(nowDate), epoch=Math.floor(nowDate.getTime()/1000);
   let state=JSON.parse(user.state), authorized=user.authorized, name=user.name, department=user.department;
   const mutations=[];
-  const admin=String(env.ADMIN_IDS||'').split(',').map(x=>x.trim()).includes(String(user.id));
+  const listedAdmin=String(env.ADMIN_IDS||'').split(',').map(x=>x.trim()).includes(String(user.id));
+  let admin=listedAdmin && (state.adminUntil||0)>epoch;
   const text=update.message?.text?.trim() || '';
   const cb=update.callback_query?.data || '';
-  const move=(step, data={}) => {state={step,nonce:nonce(),expires:epoch+3600,...data};};
+  const move=(step, data={}) => {state={adminUntil:state.adminUntil||0,adminAttempts:state.adminAttempts||0,adminRetryAt:state.adminRetryAt||0,step,nonce:nonce(),expires:epoch+3600,...data};};
   const b=(label, action, value='') => button(label,`b:${state.nonce}:${action}:${value}`);
   const reply=(message,keyboard=menu()) => ({user:{authorized,name,department,state},mutations,
     response:{chat_id:user.id,text:message,reply_markup:{inline_keyboard:keyboard}}});
@@ -75,7 +76,7 @@ export async function plan(env, user, update, nowDate = new Date()) {
     const rows=(await stmt(db,`SELECT * FROM bookings WHERE room_id=? AND day=? AND status='active' ORDER BY start_min`,id,day).all()).results;
     page=Math.max(0,Math.min(Math.floor(Math.max(0,rows.length-1)/5),page));
     move('schedule',{room:id,day});
-    const blocks=rows.slice(page*5,page*5+5).map(x=>`${time(x.start_min)}–${time(x.end_min)} · ${x.name}\n${x.department}${x.comment?'\n'+x.comment:''}${admin?'\nID: '+x.id:''}`);
+    const blocks=rows.slice(page*5,page*5+5).map(x=>`${time(x.start_min)}–${time(x.end_min)} · ${x.name}\n${x.department}${x.comment?'\n'+x.comment:''}${admin?'\nTelegram ID: '+x.user_id+'\nID брони: '+x.id:''}`);
     const busy=new Set(await occupied(id,day)), free=[];
     let start=null;
     for(let m=cfg.open;m<=cfg.close;m+=30) {
@@ -106,9 +107,59 @@ export async function plan(env, user, update, nowDate = new Date()) {
     move('cancel_confirm',{booking:id});
     return reply('Отменить эту бронь?\n\n'+details(row,{name:row.room_name}),[[b('Да, отменить бронь','cancel_yes')],home]);
   };
+
+  const profile=()=> {
+    move('profile');
+    return reply(`👤 Мой профиль\n\nИмя: ${name}\nОтдел: ${department}\nTelegram ID: ${user.id}\n\nДанные сохранены. Повторно вводить их не нужно.`,[
+      [b('✏️ Изменить имя','edit_name')],[b('✏️ Изменить отдел','edit_department')],home]);
+  };
+  const adminHome=()=> {
+    move('admin_home');
+    return reply('🛠 Панель администратора\n\nВыберите действие. Доступ открыт на 1 час.\nПри создании брони владельцем будете вы; назначение встречи можно указать в комментарии.',[
+      [b('📋 Текущие и будущие брони','admin_active',0)],
+      [b('🗂 История всех броней','admin_history',0)],
+      [b('👥 Сотрудники и Telegram ID','admin_users',0)],
+      [b('➕ Создать бронь','admin_new')],
+      [b('🔎 Найти бронь по ID','admin_find')],
+      [b('📊 Статистика','admin_stats')],
+      [b('🔒 Выйти из админ-панели','admin_logout')],home]);
+  };
+  const adminBack=()=>[b('← Админ-панель','admin_home')];
+  const adminBookings=async (history,page=0)=> {
+    page=Math.max(0,Math.trunc(Number(page)||0));
+    const where=history?'1=1':"b.status='active' AND (b.day>? OR (b.day=? AND b.end_min>?))";
+    const args=history?[]:[now.day,now.day,now.minute];
+    const count=await stmt(db,`SELECT count(*) AS n FROM bookings b WHERE ${where}`,...args).first();
+    page=Math.min(page,Math.floor(Math.max(0,count.n-1)/4));
+    const rows=(await stmt(db,`SELECT b.*,r.name AS room_name FROM bookings b JOIN rooms r ON r.id=b.room_id WHERE ${where} ORDER BY b.day ${history?'DESC':'ASC'},b.start_min,b.id LIMIT 4 OFFSET ?`,...args,page*4).all()).results;
+    move('admin_list',{history});
+    const lines=rows.map((x,i)=>`${i+1}. ${x.room_name}\n${date(x.day)} · ${time(x.start_min)}–${time(x.end_min)}\n${x.name} · ${x.department}\nTelegram ID: ${x.user_id}\nID брони: ${x.id}\nСтатус: ${x.status==='cancelled'?'отменена':x.day<now.day||(x.day===now.day&&x.end_min<=now.minute)?'завершена':'активна'}${x.cancelled_by?'\nОтменил (Telegram ID): '+x.cancelled_by:''}${x.comment?'\n💬 '+x.comment:''}`);
+    const action=history?'admin_history':'admin_active',nav=[];
+    if(page>0)nav.push(b('← Назад',action,page-1));
+    if((page+1)*4<count.n)nav.push(b('Далее →',action,page+1));
+    return reply(`${history?'🗂 История':'📋 Текущие и будущие брони'} · всего ${count.n}\nСтраница ${page+1}\n\n${lines.join('\n\n')||'Броней нет.'}`,[
+      ...rows.map((x,i)=>[b(`Открыть №${i+1}`,'admin_view',x.id)]),...(nav.length?[nav]:[]),adminBack(),home]);
+  };
+  const adminView=async id=> {
+    const row=await stmt(db,'SELECT b.*,r.name AS room_name FROM bookings b JOIN rooms r ON r.id=b.room_id WHERE b.id=?',id).first();
+    if(!row)return reply('Бронь с таким ID не найдена.',[adminBack(),home]);
+    move('admin_view',{booking:id});
+    return reply(details(row,{name:row.room_name})+`\n\nTelegram ID: ${row.user_id}\nID брони: ${row.id}\nСтатус: ${row.status==='cancelled'?'отменена':'не отменена'}${row.cancelled_by?'\nОтменил (Telegram ID): '+row.cancelled_by:''}`,[
+      ...(row.status==='active'?[[b('❌ Отменить эту бронь','admin_cancel',row.id)]]:[]),adminBack(),home]);
+  };
+  const adminUsers=async page=> {
+    page=Math.max(0,Math.trunc(Number(page)||0));
+    const count=await db.prepare('SELECT count(*) AS n FROM users WHERE authorized=1').first();
+    page=Math.min(page,Math.floor(Math.max(0,count.n-1)/8));
+    const rows=(await stmt(db,'SELECT id,name,department FROM users WHERE authorized=1 ORDER BY id LIMIT 8 OFFSET ?',page*8).all()).results;
+    move('admin_users');const nav=[];
+    if(page>0)nav.push(b('← Назад','admin_users',page-1));
+    if((page+1)*8<count.n)nav.push(b('Далее →','admin_users',page+1));
+    return reply(`👥 Сотрудники · всего ${count.n}\nСтраница ${page+1}\n\n`+rows.map(x=>`${x.name||'Профиль не заполнен'}\n${x.department||'Отдел не указан'}\nTelegram ID: ${x.id}`).join('\n\n'),[...(nav.length?[nav]:[]),adminBack(),home]);
+  };
   if(text==='/id') return reply(`Ваш Telegram ID: ${user.id}`,authorized?menu():[]);
   if(!authorized) {
-    if(admin) { authorized=1; move('name'); return reply('Добро пожаловать! Напишите ваше имя и фамилию.',[]); }
+    if(listedAdmin) { authorized=1; move('name'); return reply('Добро пожаловать! Напишите ваше имя и фамилию.',[]); }
     const attempts=state.attempts||0, until=state.until||0;
     if(until>epoch && attempts>=5) return reply('Слишком много попыток. Повторите через 15 минут.',[]);
     if(!text || text.startsWith('/')) return reply('🏢 Переговорные IT Park\n\nВведите код доступа сотрудников. Его можно получить у ответственного за переговорные.\nИмя, отдел и комментарий к брони будут видны другим сотрудникам.',[]);
@@ -119,7 +170,7 @@ export async function plan(env, user, update, nowDate = new Date()) {
     authorized=1; move('name'); return reply('Доступ открыт ✅\nНапишите ваше имя и фамилию (2–80 символов).',[]);
   }
   if(name && department && (['/start','/menu','/cancel'].includes(text)||cb==='menu:home')) return main();
-  if(text==='/profile'||cb==='menu:profile') {move('name');return reply('Напишите ваше имя и фамилию (2–80 символов).',[home]);}
+  if((text==='/profile'||cb==='menu:profile') && name && department) return profile();
   if(state.step==='name'||(!name&&state.step!=='department')) {
     if(!text || text.startsWith('/') || clean(text).length<2 || clean(text).length>80) return reply('Напишите ваше имя и фамилию: от 2 до 80 символов.',[]);
     name=clean(text);move('department');return reply('Как называется ваш отдел? (2–100 символов)',[]);
@@ -128,8 +179,36 @@ export async function plan(env, user, update, nowDate = new Date()) {
     if(!text || text.startsWith('/') || clean(text).length<2 || clean(text).length>100) return reply('Напишите название отдела: от 2 до 100 символов.',[]);
     department=clean(text);return main(`Профиль сохранён ✅\n👤 ${name}\n🏷 ${department}\n\nТеперь можно бронировать переговорные.`);
   }
+
+  if(text==='/admin') {
+    if(!listedAdmin)return reply('Админ-панель доступна только назначенным администраторам. Ваш ID: '+user.id);
+    if(!env.ADMIN_PASSCODE)return reply('Не задан ADMIN_PASSCODE в настройках Cloudflare.');
+    if(admin)return adminHome();
+    move('admin_password');return reply('🔐 Введите код администратора. /cancel — выйти.',[home]);
+  }
+  if(state.step==='admin_password' && text && !text.startsWith('/')) {
+    if(!listedAdmin || !env.ADMIN_PASSCODE)return main('Нет доступа к админ-панели.');
+    if(state.adminRetryAt>epoch && state.adminAttempts>=5)return reply('Слишком много попыток. Повторите через 15 минут.',[home]);
+    if(text!==env.ADMIN_PASSCODE) {
+      if(!(state.adminRetryAt>epoch)){state.adminAttempts=0;state.adminRetryAt=epoch+900;}
+      state.adminAttempts=(state.adminAttempts||0)+1;
+      return reply('Неверный код администратора.',[home]);
+    }
+    state.adminUntil=epoch+3600;state.adminAttempts=0;state.adminRetryAt=0;admin=true;return adminHome();
+  }
+  if(state.step==='admin_find' && text && !text.startsWith('/')) {
+    if(!admin)return main('Доступ истёк. Войдите через /admin.');
+    return adminView(text);
+  }
+  if(['edit_name','edit_department'].includes(state.step) && text && !text.startsWith('/')) {
+    if(state.expires<epoch)return profile();
+    const value=clean(text),limit=state.step==='edit_name'?80:100;
+    if(value.length<2||value.length>limit)return reply(`Введите от 2 до ${limit} символов.`,[home]);
+    if(state.step==='edit_name')name=value;else department=value;
+    return profile();
+  }
   if(text==='/start'||text==='/menu'||text==='/cancel'||cb==='menu:home') return main();
-  if(text==='/help'||cb==='menu:help') return reply(`Как забронировать:\n1. Нажмите «Забронировать».\n2. Выберите этаж, дату и время.\n3. Укажите длительность (шаг 30 минут).\n4. Добавьте комментарий или пропустите.\n5. Нажмите «Подтвердить».\n\nДо подтверждения время не закрепляется. При одновременных заявках выигрывает первая успешная запись в базу.\n\nЧасы: ${time(cfg.open)}–${time(cfg.close)}, включая выходные. Максимум ${cfg.maxDuration/60} ч. за одну бронь.\nВсе даты и время — Ташкент. Имя, отдел и комментарий видны сотрудникам.\nОтмена: «Мои брони». Изменение: отмените бронь и создайте новую.\n/cancel — выйти из текущего шага. /profile — изменить профиль. /id — ваш ID.${admin?'\n\nАдминистратор: /cancel_booking ID — отменить любую бронь. ID отображаются в расписании.':''}`);
+  if(text==='/help'||cb==='menu:help') return reply(`Как забронировать:\n1. Нажмите «Забронировать».\n2. Выберите этаж, дату и время.\n3. Укажите длительность (шаг 30 минут).\n4. Добавьте комментарий или пропустите.\n5. Нажмите «Подтвердить».\n\nДо подтверждения время не закрепляется. При одновременных заявках выигрывает первая успешная запись в базу.\n\nЧасы: ${time(cfg.open)}–${time(cfg.close)}, включая выходные. Максимум ${cfg.maxDuration/60} ч. за одну бронь.\nВсе даты и время — Ташкент. Имя, отдел и комментарий видны сотрудникам.\nОтмена: «Мои брони». Изменение: отмените бронь и создайте новую.\n/cancel — выйти из текущего шага. /profile — посмотреть или изменить профиль. /id — ваш ID.${admin?'\n\nАдминистратор: /cancel_booking ID — отменить любую бронь. ID отображаются в расписании. /admin — панель управления.':''}`);
   if(text==='/book'||cb==='menu:new') return chooseRooms('book');
   if(text==='/schedule'||cb==='menu:schedule') return chooseRooms('schedule');
   if(text==='/my'||cb.startsWith('menu:mine:')) return mine(Number(cb.split(':')[2])||0);
@@ -137,6 +216,28 @@ export async function plan(env, user, update, nowDate = new Date()) {
   if(cb.startsWith('b:')) {
     const [,token,action,value]=cb.split(':');
     if(token!==state.nonce || state.expires<epoch) return reply('Эта кнопка устарела. Начните заново через меню.');
+
+    if(action==='edit_name'||action==='edit_department') {
+      if(state.step!=='profile')return profile();
+      move(action);return reply(action==='edit_name'?'Введите новое имя и фамилию (2–80 символов).':'Введите новое название отдела (2–100 символов).',[home]);
+    }
+    if(action.startsWith('admin_')) {
+      if(!admin)return main('Нет доступа или сессия истекла. Войдите через /admin.');
+      if(action==='admin_home')return adminHome();
+      if(action==='admin_active')return adminBookings(false,value);
+      if(action==='admin_history')return adminBookings(true,value);
+      if(action==='admin_users')return adminUsers(value);
+      if(action==='admin_view')return adminView(value);
+      if(action==='admin_cancel')return cancelPrompt(value);
+      if(action==='admin_new')return chooseRooms('book');
+      if(action==='admin_find'){move('admin_find');return reply('Отправьте полный ID брони.',[adminBack(),home]);}
+      if(action==='admin_logout'){state.adminUntil=0;admin=false;return main('Вы вышли из админ-панели.');}
+      if(action==='admin_stats'){
+        const stats=await stmt(db,`SELECT count(*) AS total,sum(CASE WHEN status='cancelled' THEN 1 ELSE 0 END) AS cancelled,sum(CASE WHEN status='active' AND (day>? OR (day=? AND end_min>?)) THEN 1 ELSE 0 END) AS upcoming FROM bookings`,now.day,now.day,now.minute).first();
+        move('admin_stats');return reply(`📊 Статистика\nВсего броней: ${stats.total}\nТекущих и будущих: ${stats.upcoming||0}\nОтменённых: ${stats.cancelled||0}`,[adminBack(),home]);
+      }
+      return adminHome();
+    }
     if(action==='rooms') return chooseRooms(state.mode||'book');
     if(action==='dates') return chooseDays(state.room,state.mode||'book');
     if(action==='days' && state.step==='day') return chooseDays(state.room,state.mode,Number(value)||0);

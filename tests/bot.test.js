@@ -15,7 +15,7 @@ class DB {
 }
 const NOW=new Date('2026-09-28T04:00:00Z'); // 09:00 Tashkent
 const DAY='2026-09-29';
-function setup(){return {DB:new DB(),STAFF_ACCESS_CODE:'test-code',ADMIN_IDS:'999'};}
+function setup(){return {DB:new DB(),STAFF_ACCESS_CODE:'test-code',ADMIN_IDS:'999',ADMIN_PASSCODE:'test-admin-code'};}
 let seq=100;
 const update=(id,text)=>({update_id:++seq,message:{text,from:{id},chat:{id,type:'private'}}});
 const callback=(id,data)=>({update_id:++seq,callback_query:{id:String(seq),data,from:{id},message:{chat:{id,type:'private'}}}});
@@ -31,7 +31,7 @@ test('Russian onboarding, optional comment, booking and profile snapshot',async(
  assert.match(response.text,/забронирована/);const b=rows(env,'SELECT * FROM bookings')[0];
  assert.equal(b.name,'Сотрудник 1');assert.equal(b.department,'Отдел аналитики');assert.equal(b.comment,'');
  assert.equal(rows(env,'SELECT * FROM booking_slots').length,2);
- await send(env,1,'/profile');await send(env,1,'Новое Имя');await send(env,1,'Другой отдел');assert.equal(rows(env,'SELECT name FROM bookings')[0].name,'Сотрудник 1');
+ await send(env,1,'/profile');await click(env,1,'edit_name');await send(env,1,'Новое Имя');await click(env,1,'edit_department');await send(env,1,'Другой отдел');assert.equal(rows(env,'SELECT name FROM bookings')[0].name,'Сотрудник 1');
 });
 test('25 concurrent users: exactly one success, no orphan booking or partial slots',async()=>{
  const env=setup();for(let id=1;id<=25;id++){await register(env,id);await prepare(env,id);}
@@ -79,7 +79,7 @@ test('other user cannot cancel; admin can cancel with audit identity',async()=>{
  const env=setup();await register(env,1);await register(env,2);await register(env,999);await book(env,1);
  const id=rows(env,'SELECT id FROM bookings')[0].id;await send(env,2,'/my');assert.match((await click(env,2,'cancel',id)).text,/нет права/);
  assert.equal(rows(env,'SELECT * FROM booking_slots').length,2);
- await send(env,999,'/cancel_booking '+id);await click(env,999,'cancel_yes');assert.equal(rows(env,'SELECT * FROM booking_slots').length,0);
+ await send(env,999,'/admin');await send(env,999,'test-admin-code');await send(env,999,'/cancel_booking '+id);await click(env,999,'cancel_yes');assert.equal(rows(env,'SELECT * FROM booking_slots').length,0);
  assert.equal(rows(env,'SELECT cancelled_by FROM bookings')[0].cancelled_by,999);
 });
 test('forged duration, past time and stale callback cannot book',async()=>{
@@ -135,4 +135,58 @@ test('Telegram send failure returns 503; replay delivers persisted response once
   assert.equal((await worker.fetch(request(),env)).status,200);assert.equal(calls,2);
   assert.equal(rows(env,`SELECT delivered FROM receipts WHERE update_id=${event.update_id}`)[0].delivered,1);
  }finally{globalThis.fetch=originalFetch;}
+});
+
+test('profile opens read-only, persists across start, edits fields independently',async()=>{
+ const env=setup();await register(env,1);
+ for(let i=0;i<3;i++) {assert.match((await send(env,1,'/profile')).text,/Сотрудник 1/);await send(env,1,'/start');}
+ await send(env,1,'/profile');await click(env,1,'edit_name');await send(env,1,'Бобур Рустамов');
+ let u=rows(env,'SELECT * FROM users')[0];assert.equal(u.name,'Бобур Рустамов');assert.equal(u.department,'Отдел аналитики');
+ await click(env,1,'edit_department');await send(env,1,'Инвестиции');u=rows(env,'SELECT * FROM users')[0];assert.equal(u.name,'Бобур Рустамов');assert.equal(u.department,'Инвестиции');
+ await send(env,1,'/start');assert.equal(rows(env,'SELECT name FROM users')[0].name,'Бобур Рустамов');
+});
+test('admin requires allowlisted ID and passcode; ordinary user cannot forge admin callback',async()=>{
+ const env=setup();await register(env,1);await register(env,999);await book(env,1);
+ assert.match((await send(env,1,'/admin')).text,/только назначенным/);
+ await send(env,1,'test-admin-code');assert.match((await click(env,1,'admin_active',0)).text,/Нет доступа/);
+ await send(env,999,'/admin');assert.match((await send(env,999,'wrong')).text,/Неверный/);
+ assert.match((await click(env,999,'admin_users',0)).text,/Нет доступа/);
+ await send(env,999,'/admin');assert.match((await send(env,999,'test-admin-code')).text,/Панель администратора/);
+ const response=await click(env,999,'admin_active',0);assert.match(response.text,/Telegram ID: 1/);
+ await send(env,1,'/schedule');await click(env,1,'room',5);assert.doesNotMatch((await click(env,1,'day',DAY)).text,/Telegram ID/);
+});
+test('admin list, detail, cancel confirmation, history, users and create booking',async()=>{
+ const env=setup();await register(env,1);await register(env,999);await book(env,1);
+ await send(env,999,'/admin');await send(env,999,'test-admin-code');
+ await click(env,999,'admin_active',0);const id=rows(env,'SELECT id FROM bookings')[0].id;
+ assert.match((await click(env,999,'admin_view',id)).text,/Telegram ID: 1/);
+ await click(env,999,'admin_cancel',id);assert.equal(rows(env,'SELECT * FROM booking_slots').length,2);
+ await click(env,999,'cancel_yes');assert.equal(rows(env,'SELECT * FROM booking_slots').length,0);
+ await send(env,999,'/admin');assert.match((await click(env,999,'admin_history',0)).text,/Отменил \(Telegram ID\): 999/);
+ assert.match((await click(env,999,'admin_users',0)).text,/Telegram ID: 1/);
+ await click(env,999,'admin_new');await click(env,999,'room',5);await click(env,999,'day',DAY);await click(env,999,'start',600);await click(env,999,'duration',630);await click(env,999,'skip');await click(env,999,'confirm');
+ assert.equal(rows(env,"SELECT user_id FROM bookings WHERE status='active'")[0].user_id,999);
+});
+test('admin brute force limit survives /start and /admin; logout and expiry revoke privileges',async()=>{
+ const env=setup();await register(env,999);
+ for(let i=0;i<5;i++){await send(env,999,'/admin');await send(env,999,'wrong');await send(env,999,'/start');}
+ await send(env,999,'/admin');assert.match((await send(env,999,'test-admin-code')).text,/много попыток/);
+ const later=new Date(NOW.getTime()+16*60000);
+ assert.match((await processUpdate(env,update(999,'test-admin-code'),later)).text,/Панель администратора/);
+ const expired=new Date(later.getTime()+61*60000);
+ assert.match((await processUpdate(env,update(999,'/admin'),expired)).text,/Введите код/);
+ await processUpdate(env,update(999,'test-admin-code'),expired);
+ const u=rows(env,'SELECT state FROM users')[0],state=JSON.parse(u.state);
+ await processUpdate(env,callback(999,`b:${state.nonce}:admin_logout:`),expired);
+ assert.match((await processUpdate(env,update(999,'/admin'),expired)).text,/Введите код/);
+});
+test('admin expired after opening cancellation cannot cancel another user booking',async()=>{
+ const env=setup();await register(env,1);await register(env,999);await book(env,1);
+ await send(env,999,'/admin');await send(env,999,'test-admin-code');
+ const id=rows(env,'SELECT id FROM bookings')[0].id;
+ const later=new Date(NOW.getTime()+59*60000);
+ await processUpdate(env,update(999,'/cancel_booking '+id),later);
+ const state=JSON.parse(rows(env,'SELECT state FROM users WHERE id=999')[0].state);
+ const response=await processUpdate(env,callback(999,`b:${state.nonce}:cancel_yes:`),new Date(NOW.getTime()+61*60000));
+ assert.match(response.text,/Нет права/);assert.equal(rows(env,'SELECT * FROM booking_slots').length,2);
 });
