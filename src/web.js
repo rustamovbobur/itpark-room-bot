@@ -8,6 +8,7 @@ const ok=(value,status=200,headers={})=>Response.json(value,{status,headers:{'ca
 const cookie=(token,age)=>`itpark_session=${token}; HttpOnly; Secure; SameSite=Lax; Path=/api; Max-Age=${age}`;
 const sanitize=(str,max)=>typeof str==='string'?str.trim().replace(/[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/g,' ').replace(/\s+/g,' ').slice(0,max+1):'';
 const randomToken=()=>Array.from(crypto.getRandomValues(new Uint8Array(32)),b=>b.toString(16).padStart(2,'0')).join('');
+const loginCode=()=>{const alphabet='ABCDEFGHJKLMNPQRSTUVWXYZ23456789';const bytes=crypto.getRandomValues(new Uint8Array(10));return Array.from(bytes,b=>alphabet[b%alphabet.length]).join('');};
 const readJson=async request=>{
   if(!(request.headers.get('content-type')||'').toLowerCase().startsWith('application/json'))throw new Error('type');
   if(Number(request.headers.get('content-length'))>4096)throw new Error('size');
@@ -19,6 +20,39 @@ const ipKey=async request=>hash(request.headers.get('cf-connecting-ip')||'unknow
 export async function web(request,env,clock=new Date()){
   const url=new URL(request.url),method=request.method,db=env.DB,epoch=Math.floor(clock.getTime()/1000),now=localNow(clock),cfg=config(env);
   if(method==='POST' && request.headers.get('origin')!==url.origin)return error(403,'Обновите страницу и попробуйте ещё раз.');
+  if(url.pathname==='/api/request-code'&&method==='POST'){
+    let body;try{body=await readJson(request);}catch{return error(400,'Проверьте данные формы.');}
+    const id=Number(body.telegramId),signup=body.signup===true;
+    if(!Number.isSafeInteger(id)||id<=0||String(id)!==String(body.telegramId).trim())return error(400,'Введите свой числовой Telegram ID из команды /id.');
+    const source=await ipKey(request),perUser=await hash(source+':'+id);
+    try{
+      for(const key of [source,perUser]){
+        await stmt(db,`INSERT INTO web_code_requests(source_hash,attempts,window_end) VALUES(?,1,?)
+          ON CONFLICT(source_hash) DO UPDATE SET attempts=CASE WHEN window_end<? THEN 1 ELSE attempts+1 END,
+          window_end=CASE WHEN window_end<? THEN excluded.window_end ELSE window_end END`,key,epoch+900,epoch,epoch).run();
+      }
+      const ip=await stmt(db,'SELECT attempts FROM web_code_requests WHERE source_hash=?',source).first();
+      const userAttempts=await stmt(db,'SELECT attempts FROM web_code_requests WHERE source_hash=?',perUser).first();
+      if(ip.attempts>30||userAttempts.attempts>5)return error(429,'Слишком много запросов кода. Повторите через 15 минут.');
+      const existing=await stmt(db,'SELECT authorized,name,department FROM users WHERE id=?',id).first();
+      if(signup && existing?.authorized && existing.name && existing.department)return error(400,'Вы уже зарегистрированы. Выберите «У меня есть профиль».');
+      if(!signup && (!existing?.authorized||!existing.name||!existing.department))return error(400,'Профиль не найден. Выберите «Первый вход».');
+      const name=sanitize(body.name,80),department=sanitize(body.department,100);
+      if(signup && (name.length<2||name.length>80||department.length<2||department.length>100||!env.STAFF_ACCESS_CODE||body.staffCode!==env.STAFF_ACCESS_CODE))
+        return error(400,'Проверьте имя, отдел и код доступа сотрудников у ответственного.');
+      const code=loginCode(),digest=await hash(code);
+      const endpoint=`https://api.telegram.org/bot${env.BOT_TOKEN}/sendMessage`;
+      let sent=false;
+      try{const response=await fetch(endpoint,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({chat_id:id,text:`🔐 Код входа на сайт IT Park: ${code}\n\nДействует 10 минут и только один раз. Никому его не пересылайте.`}),signal:AbortSignal.timeout(10000)});sent=response.ok&&(await response.json()).ok===true;}catch{/* Bot cannot reach Telegram. */}
+      if(!sent)return error(400,'Бот не смог отправить код. Откройте бота в Telegram, нажмите Start, отправьте /id и попробуйте ещё раз.');
+      if(signup){
+        await db.batch([stmt(db,'DELETE FROM web_signups WHERE user_id=?',id),stmt(db,'INSERT INTO web_signups(code_hash,user_id,name,department,expires_at) VALUES(?,?,?,?,?)',digest,id,name,department,epoch+600)]);
+      }else{
+        await db.batch([stmt(db,'DELETE FROM web_codes WHERE user_id=?',id),stmt(db,'INSERT INTO web_codes(code_hash,user_id,expires_at) VALUES(?,?,?)',digest,id,epoch+600)]);
+      }
+      return ok({ok:true});
+    }catch{return error(503,'Сервис временно недоступен. Попробуйте ещё раз позже.');}
+  }
   if(url.pathname==='/api/login'&&method==='POST'){
     let body;try{body=await readJson(request);}catch{return error(400,'Введите код с сайта в правильном формате.');}
     const code=String(body.code||'').trim().toUpperCase();if(!/^[A-Z2-9]{10}$/.test(code))return error(400,'Введите 10-символьный код из Telegram.');
@@ -32,10 +66,19 @@ export async function web(request,env,clock=new Date()){
       const digest=await hash(code);
       const found=await stmt(db,`SELECT c.user_id FROM web_codes c JOIN users u ON u.id=c.user_id
         WHERE c.code_hash=? AND c.expires_at>? AND u.authorized=1 AND length(u.name)>0 AND length(u.department)>0`,digest,epoch).first();
-      if(!found)return error(401,'Код неверен или его срок истёк. Отправьте /web боту ещё раз.');
+      const pending=found?null:await stmt(db,'SELECT user_id,name,department FROM web_signups WHERE code_hash=? AND expires_at>?',digest,epoch).first();
+      if(!found&&!pending)return error(401,'Код неверен или истёк. Запросите новый код на странице входа.');
       const token=randomToken(),tokenHash=await hash(token);
       // Deletion and guard make the one-time code single-use even with concurrent requests.
-      await db.batch([
+      await db.batch(pending?[
+        stmt(db,'DELETE FROM web_signups WHERE code_hash=? AND expires_at>?',digest,epoch),
+        db.prepare('INSERT INTO state_guard(ok) VALUES(changes())'),
+        db.prepare('DELETE FROM state_guard'),
+        stmt(db,'INSERT INTO users(id) VALUES(?) ON CONFLICT(id) DO NOTHING',pending.user_id),
+        stmt(db,'UPDATE users SET authorized=1,name=?,department=? WHERE id=? AND (authorized=0 OR length(name)=0 OR length(department)=0)',pending.name,pending.department,pending.user_id),
+        stmt(db,'INSERT INTO web_sessions(token_hash,user_id,expires_at,created_at) VALUES(?,?,?,?)',tokenHash,pending.user_id,epoch+30*86400,epoch),
+        stmt(db,'DELETE FROM web_login_attempts WHERE source_hash=?',source)
+      ]:[
         stmt(db,'DELETE FROM web_codes WHERE code_hash=? AND expires_at>?',digest,epoch),
         db.prepare('INSERT INTO state_guard(ok) VALUES(changes())'),
         db.prepare('DELETE FROM state_guard'),
@@ -43,7 +86,7 @@ export async function web(request,env,clock=new Date()){
         stmt(db,'DELETE FROM web_login_attempts WHERE source_hash=?',source)
       ]);
       return ok({ok:true},200,{'set-cookie':cookie(token,30*86400)});
-    }catch{return error(401,'Код уже использован или временно недоступен. Отправьте /web боту ещё раз.');}
+    }catch{return error(401,'Код уже использован или временно недоступен. Запросите новый код.');}
   }
   const token=/^(?:.*;\s*)?itpark_session=([a-f0-9]{64})(?:;.*)?$/.exec(request.headers.get('cookie')||'')?.[1];
   const session=token?await stmt(db,`SELECT u.id,u.name,u.department,u.authorized FROM web_sessions s JOIN users u ON u.id=s.user_id

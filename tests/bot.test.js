@@ -33,6 +33,15 @@ test('Russian onboarding, optional comment, booking and profile snapshot',async(
  assert.equal(rows(env,'SELECT * FROM booking_slots').length,2);
  await send(env,1,'/profile');await click(env,1,'edit_name');await send(env,1,'Новое Имя');await click(env,1,'edit_department');await send(env,1,'Другой отдел');assert.equal(rows(env,'SELECT name FROM bookings')[0].name,'Сотрудник 1');
 });
+test('schedule keeps its mode when selecting another day',async()=>{
+ const env=setup();await register(env,1);
+ await send(env,1,'/schedule');await click(env,1,'room',5);
+ assert.match((await click(env,1,'day',DAY)).text,/Свободно:/);
+ await click(env,1,'dates');
+ const next=await click(env,1,'day','2026-09-30');
+ assert.match(next.text,/Свободно:/);
+ assert.doesNotMatch(next.text,/Выберите начало/);
+});
 test('25 concurrent users: exactly one success, no orphan booking or partial slots',async()=>{
  const env=setup();for(let id=1;id<=25;id++){await register(env,id);await prepare(env,id);}
  const results=await Promise.all(Array.from({length:25},(_,i)=>click(env,i+1,'confirm')));

@@ -24,7 +24,7 @@ export async function plan(env, user, update, nowDate = new Date()) {
   const b=(label, action, value='') => button(label,`b:${state.nonce}:${action}:${value}`);
   const reply=(message,keyboard=menu()) => ({user:{authorized,name,department,state},mutations,
     response:{chat_id:user.id,text:message,reply_markup:{inline_keyboard:keyboard}}});
-  const main=(message='🏢 Переговорные IT Park\n\nВыберите действие. Время — Ташкент (UTC+5).') => {move('home'); return reply(message);};
+  const main=(message='🏢 Meeting Rooms IT Park\n\nВыберите действие. Время — Ташкент (UTC+5).') => {move('home'); return reply(message);};
   const room=async id=>stmt(db,'SELECT * FROM rooms WHERE id=? AND active=1',id).first();
   const occupied=async (id,day)=> (await stmt(db,'SELECT minute FROM booking_slots WHERE room_id=? AND day=?',id,day).all()).results.map(x=>x.minute);
   const chooseRooms=async mode=> {
@@ -75,7 +75,7 @@ export async function plan(env, user, update, nowDate = new Date()) {
     const r=await room(id); if(!r || !validDay(day,now,cfg.horizon)) return chooseRooms('schedule');
     const rows=(await stmt(db,`SELECT * FROM bookings WHERE room_id=? AND day=? AND status='active' ORDER BY start_min`,id,day).all()).results;
     page=Math.max(0,Math.min(Math.floor(Math.max(0,rows.length-1)/5),page));
-    move('schedule',{room:id,day});
+    move('schedule',{room:id,day,mode:'schedule'});
     const blocks=rows.slice(page*5,page*5+5).map(x=>`${time(x.start_min)}–${time(x.end_min)} · ${x.name}\n${x.department}${x.comment?'\n'+x.comment:''}${admin?'\nTelegram ID: '+x.user_id+'\nID брони: '+x.id:''}`);
     const busy=new Set(await occupied(id,day)), free=[];
     let start=null;
@@ -171,7 +171,7 @@ export async function plan(env, user, update, nowDate = new Date()) {
     if(listedAdmin) { authorized=1; move('name'); return reply('Добро пожаловать! Напишите ваше имя и фамилию.',[]); }
     const attempts=state.attempts||0, until=state.until||0;
     if(until>epoch && attempts>=5) return reply('Слишком много попыток. Повторите через 15 минут.',[]);
-    if(!text || text.startsWith('/')) return reply('🏢 Переговорные IT Park\n\nВведите код доступа сотрудников. Его можно получить у ответственного за переговорные.\nИмя, отдел и комментарий к брони будут видны другим сотрудникам.',[]);
+    if(!text || text.startsWith('/')) return reply('🏢 Meeting Rooms IT Park\n\nВведите код доступа сотрудников. Его можно получить у ответственного за переговорные.\nИмя, отдел и комментарий к брони будут видны другим сотрудникам.',[]);
     if(text!==env.STAFF_ACCESS_CODE) {
       state={step:'access',attempts:until>epoch?attempts+1:1,until:until>epoch?until:epoch+900};
       return reply('Код не подошёл. Проверьте его у ответственного за переговорные.',[]);

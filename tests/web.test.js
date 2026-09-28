@@ -9,7 +9,7 @@ import {client} from '../src/site.js';
 const NOW=new Date('2026-09-28T04:00:00Z'),BASE='https://test.example';
 const req=(path,method='GET',body,cookie,origin=BASE)=>new Request(BASE+path,{method,headers:{...(method==='POST'?{'content-type':'application/json',origin}:{}),...(cookie?{cookie}:{})},body:body?JSON.stringify(body):undefined});
 async function setup(){const mf=new Miniflare(convertV4MiniflareOptions({modules:true,script:'export default {fetch(){return new Response("ok")}}',d1Databases:['DB'],compatibilityDate:'2026-09-01'}));
- const db=await mf.getD1Database('DB');for(const name of ['0001_initial.sql','0002_web.sql']){
+ const db=await mf.getD1Database('DB');for(const name of ['0001_initial.sql','0002_web.sql','0003_site_signup.sql']){
   const schema=readFileSync(new URL('../migrations/'+name,import.meta.url),'utf8');
   const statements=schema.replace(/^--.*$/gm,'').split(/;\s*(?=CREATE |INSERT |$)/).map(s=>s.trim()).filter(Boolean);
   for(const s of statements)await db.prepare(s.replace(/\n/g,' ')).run();
@@ -36,6 +36,37 @@ test('website session belongs to Telegram identity, token is secure and code sin
   assert.equal((await handle(env,'/api/logout','POST',{},cookie)).status,200);
   assert.equal((await handle(env,'/api/me','GET',null,cookie)).status,401);
  }finally{await mf.dispose();}
+});
+test('site signup needs employee code and Telegram-delivered one-time proof; registration survives bot start',async()=>{
+ const {mf,db,env}=await setup(),original=globalThis.fetch;let delivered;
+ globalThis.fetch=async (_url,options)=>{delivered=JSON.parse(options.body);return Response.json({ok:true});};
+ try{
+  const newUser={telegramId:'87654321',signup:true,name:'Новый сотрудник',department:'Отдел',staffCode:'staff'};
+  assert.equal((await handle(env,'/api/request-code','POST',{...newUser,staffCode:'wrong'})).status,400);
+  assert.equal((await db.prepare('SELECT count(*) AS n FROM web_signups').first()).n,0);
+  assert.equal((await handle(env,'/api/request-code','POST',newUser)).status,200);
+  assert.equal(delivered.chat_id,87654321);
+  assert.equal((await db.prepare('SELECT count(*) AS n FROM users WHERE id=87654321').first()).n,0);
+  const code=delivered.text.match(/[A-Z2-9]{10}/)[0];
+  assert.equal((await handle(env,'/api/login','POST',{code:'AAAAAAAAAA'})).status,401);
+  const response=await handle(env,'/api/login','POST',{code});assert.equal(response.status,200);
+  const me=await (await handle(env,'/api/me','GET',null,response.headers.get('set-cookie'))).json();
+  assert.deepEqual([me.id,me.name,me.department],[87654321,'Новый сотрудник','Отдел']);
+  assert.equal((await handle(env,'/api/login','POST',{code})).status,401);
+  assert.equal((await handle(env,'/api/request-code','POST',{telegramId:'87654321',signup:false})).status,200);
+  const another=delivered.text.match(/[A-Z2-9]{10}/)[0];
+  assert.equal((await handle(env,'/api/login','POST',{code:another})).status,200);
+ }finally{globalThis.fetch=original;await mf.dispose();}
+});
+test('site cannot register or log in using an ID when the bot cannot reach its owner',async()=>{
+ const {mf,db,env}=await setup(),original=globalThis.fetch;
+ globalThis.fetch=async()=>Response.json({ok:false,error_code:403},{status:403});
+ try{
+  const result=await handle(env,'/api/request-code','POST',{telegramId:'77553311',signup:true,name:'Новый сотрудник',department:'Отдел',staffCode:'staff'});
+  assert.equal(result.status,400);
+  assert.equal((await db.prepare('SELECT count(*) AS n FROM web_signups').first()).n,0);
+  assert.equal((await db.prepare('SELECT count(*) AS n FROM users WHERE id=77553311').first()).n,0);
+ }finally{globalThis.fetch=original;await mf.dispose();}
 });
 test('web and bot share the same schedule and prevent overlap; owner cancellation releases slots',async()=>{
  const {mf,db,env}=await setup();try{
@@ -71,5 +102,6 @@ test('worker serves an actual booking app, without injecting user values into HT
   assert.match(page.headers.get('content-security-policy'),/frame-ancestors/);
   assert.equal((await worker.fetch(req('/site.js'),env)).status,200);
   assert.equal((await worker.fetch(req('/site.css'),env)).status,200);
+  const brand=await worker.fetch(req('/brand.png'),env);assert.equal(brand.status,200);assert.equal(brand.headers.get('content-type'),'image/png');
  }finally{await mf.dispose();}
 });
