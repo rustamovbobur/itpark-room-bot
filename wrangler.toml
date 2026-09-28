@@ -1,0 +1,20 @@
+name = "itpark-room-bot"
+main = "src/worker.js"
+compatibility_date = "2026-09-01"
+workers_dev = true
+
+[vars]
+ADMIN_IDS = ""
+OPEN_HOUR = "8"
+CLOSE_HOUR = "20"
+BOOKING_DAYS = "30"
+MAX_DURATION_HOURS = "4"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "itpark-rooms"
+database_id = "REPLACE_WITH_YOUR_D1_DATABASE_ID"
+migrations_dir = "migrations"
+
+[triggers]
+crons = ["17 22 * * *"]
