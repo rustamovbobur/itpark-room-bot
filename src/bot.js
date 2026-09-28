@@ -157,6 +157,15 @@ export async function plan(env, user, update, nowDate = new Date()) {
     if((page+1)*8<count.n)nav.push(b('Далее →','admin_users',page+1));
     return reply(`👥 Сотрудники · всего ${count.n}\nСтраница ${page+1}\n\n`+rows.map(x=>`${x.name||'Профиль не заполнен'}\n${x.department||'Отдел не указан'}\nTelegram ID: ${x.id}`).join('\n\n'),[...(nav.length?[nav]:[]),adminBack(),home]);
   };
+  if(text==='/web' && authorized && name && department) {
+    const alphabet='ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+    const random=new Uint8Array(10);crypto.getRandomValues(random);
+    const code=Array.from(random,x=>alphabet[x%alphabet.length]).join('');
+    const hash=Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256',new TextEncoder().encode(code)))).map(x=>x.toString(16).padStart(2,'0')).join('');
+    mutations.push(stmt(db,'DELETE FROM web_codes WHERE user_id=?',user.id));
+    mutations.push(stmt(db,'INSERT INTO web_codes(code_hash,user_id,expires_at) VALUES(?,?,?)',hash,user.id,epoch+600));
+    return reply(`🔐 Код входа на сайт: ${code}\n\nДействует 10 минут и только один раз. Никому его не пересылайте.\n\nСайт: https://itpark-room-bot.itpark.workers.dev`,menu());
+  }
   if(text==='/id') return reply(`Ваш Telegram ID: ${user.id}`,authorized?menu():[]);
   if(!authorized) {
     if(listedAdmin) { authorized=1; move('name'); return reply('Добро пожаловать! Напишите ваше имя и фамилию.',[]); }

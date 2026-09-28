@@ -1,4 +1,6 @@
 import {processUpdate, stmt} from './bot.js';
+import {web} from './web.js';
+import {html,css,client} from './site.js';
 async function telegram(env, method, payload) {
   const response=await fetch(`https://api.telegram.org/bot${env.BOT_TOKEN}/${method}`,{
     method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(payload),signal:AbortSignal.timeout(12000)
@@ -17,6 +19,10 @@ export default {
       try {await env.DB.prepare('SELECT id FROM rooms LIMIT 1').first();return Response.json({ok:true});}
       catch {return Response.json({ok:false},{status:503});}
     }
+    if(url.pathname==='/' && request.method==='GET')return new Response(html,{headers:{'content-type':'text/html; charset=utf-8','cache-control':'no-store','x-content-type-options':'nosniff','content-security-policy':"default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'self'; frame-ancestors 'none'"}});
+    if(url.pathname==='/site.css'&&request.method==='GET')return new Response(css,{headers:{'content-type':'text/css; charset=utf-8','cache-control':'public, max-age=300','x-content-type-options':'nosniff'}});
+    if(url.pathname==='/site.js'&&request.method==='GET')return new Response(client,{headers:{'content-type':'application/javascript; charset=utf-8','cache-control':'public, max-age=300','x-content-type-options':'nosniff'}});
+    if(url.pathname.startsWith('/api/'))return web(request,env);
     if(url.pathname!=='/webhook'||request.method!=='POST') return new Response('Not found',{status:404});
     if(!env.WEBHOOK_SECRET||request.headers.get('X-Telegram-Bot-Api-Secret-Token')!==env.WEBHOOK_SECRET) return new Response('Forbidden',{status:403});
     if(!env.BOT_TOKEN||!env.STAFF_ACCESS_CODE) return new Response('Not configured',{status:503});
@@ -49,5 +55,8 @@ export default {
   async scheduled(_event,env) {
     const cutoff=Math.floor(Date.now()/1000)-7*86400;
     await stmt(env.DB,'DELETE FROM receipts WHERE created_at<? AND delivered=1',cutoff).run();
+    await stmt(env.DB,'DELETE FROM web_codes WHERE expires_at<?',Math.floor(Date.now()/1000)).run();
+    await stmt(env.DB,'DELETE FROM web_sessions WHERE expires_at<?',Math.floor(Date.now()/1000)).run();
+    await stmt(env.DB,'DELETE FROM web_login_attempts WHERE window_end<?',Math.floor(Date.now()/1000)).run();
   }
 };
