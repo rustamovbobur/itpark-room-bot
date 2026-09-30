@@ -4,7 +4,7 @@ compatibility_date = "2026-09-01"
 workers_dev = true
 
 [vars]
-ADMIN_IDS = "1314420035"
+ADMIN_IDS = "1314420035,1291869683,8794801275,423348382"
 OPEN_HOUR = "8"
 CLOSE_HOUR = "20"
 BOOKING_DAYS = "30"
