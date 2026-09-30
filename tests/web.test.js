@@ -9,7 +9,7 @@ import {client} from '../src/site.js';
 const NOW=new Date('2026-09-28T04:00:00Z'),BASE='https://test.example';
 const req=(path,method='GET',body,cookie,origin=BASE)=>new Request(BASE+path,{method,headers:{...(method==='POST'?{'content-type':'application/json',origin}:{}),...(cookie?{cookie}:{})},body:body?JSON.stringify(body):undefined});
 async function setup(){const mf=new Miniflare(convertV4MiniflareOptions({modules:true,script:'export default {fetch(){return new Response("ok")}}',d1Databases:['DB'],compatibilityDate:'2026-09-01'}));
- const db=await mf.getD1Database('DB');for(const name of ['0001_initial.sql','0002_web.sql','0003_site_signup.sql','0004_site_links.sql','0005_site_admin.sql']){
+ const db=await mf.getD1Database('DB');for(const name of ['0001_initial.sql','0002_web.sql','0003_site_signup.sql','0004_site_links.sql','0005_site_admin.sql','0006_user_colors.sql']){
   const schema=readFileSync(new URL('../migrations/'+name,import.meta.url),'utf8');
   const statements=schema.replace(/^--.*$/gm,'').split(/;\s*(?=CREATE |INSERT |ALTER |$)/).map(s=>s.trim()).filter(Boolean);
   for(const s of statements)await db.prepare(s.replace(/\n/g,' ')).run();
@@ -263,4 +263,49 @@ test('profile change during normal or admin booking cannot insert an old name',a
    assert.deepEqual(row,{name:'Актуальное имя',department:'Актуальный отдел',user_id:42});
   }finally{await mf.dispose();}
  }
+});
+
+test('admin history includes five previous days, expired slots and cancellation audit; employees cannot read it',async()=>{
+ const {mf,db,env}=await setup();try{
+  const code=await loginCode(env),cookie=(await handle(env,'/api/login','POST',{code})).headers.get('set-cookie');
+  const ac=(await handle(env,'/api/admin/login','POST',{passcode:env.ADMIN_PASSCODE},cookie)).headers.get('set-cookie');
+  const both=cookie.split(';')[0]+'; '+ac.split(';')[0];
+  await db.prepare("INSERT INTO bookings(id,user_id,room_id,day,start_min,end_min,name,department,created_at) VALUES('history',42,5,'2026-09-23',480,540,'Историческое имя','Отдел',1)").run();
+  await db.prepare("INSERT INTO bookings(id,user_id,room_id,day,start_min,end_min,name,department,created_at,status,cancelled_by,cancelled_at) VALUES('cancelled-history',42,5,'2026-09-23',480,540,'Имя','Отдел',1,'cancelled',42,2)").run();
+  await db.prepare("INSERT INTO bookings(id,user_id,room_id,day,start_min,end_min,name,department,created_at) VALUES('expired-today',42,6,'2026-09-28',480,510,'Имя','Отдел',1)").run();
+  assert.equal((await handle(env,'/api/admin/bookings?day=2026-09-23','GET',null,cookie)).status,403);
+  const response=await handle(env,'/api/admin/bookings?day=2026-09-23','GET',null,both);assert.equal(response.status,200);
+  const data=await response.json();assert.equal(data.bookings.length,2);assert.equal(data.rooms.length,3);
+  assert.ok(data.bookings.every(b=>b.canCancel===false));assert.equal(data.bookings.find(b=>b.status==='cancelled').cancelled_by,42);
+  assert.equal(data.bookings.find(b=>b.id==='history').name,'Историческое имя');
+  assert.equal((await handle(env,'/api/admin/bookings?day=2026-09-22','GET',null,both)).status,400);
+  assert.equal((await handle(env,'/api/admin/bookings?day=2026-09-31','GET',null,both)).status,400);
+  assert.equal((await handle(env,'/api/schedule?day=2026-09-23','GET',null,both)).status,400);
+  const today=await (await handle(env,'/api/admin/bookings?day=2026-09-28','GET',null,both)).json();
+  assert.equal(today.bookings[0].id,'expired-today');assert.equal(today.bookings[0].canCancel,false);
+  assert.equal((await handle(env,'/api/admin/book','POST',{userId:42,roomId:5,day:'2026-09-23',start:600,end:630},both)).status,400);
+  const ordinary={...env,ADMIN_IDS:'999'};
+  assert.equal((await handle(ordinary,'/api/admin/bookings?day=2026-09-23','GET',null,both)).status,403);
+ }finally{await mf.dispose();}
+});
+test('profile color persists, changes every booking color, permits shared custom colors, and rejects unsafe input',async()=>{
+ const {mf,db,env}=await setup();try{
+  const code=await loginCode(env),cookie=(await handle(env,'/api/login','POST',{code})).headers.get('set-cookie');
+  const initial=await (await handle(env,'/api/me','GET',null,cookie)).json();assert.match(initial.color,/^#[a-f0-9]{6}$/);
+  assert.equal((await (await handle(env,'/api/me','GET',null,cookie)).json()).color,initial.color);
+  await handle(env,'/api/book','POST',{roomId:5,day:'2026-09-29',start:600,end:630},cookie);
+  for(const color of ['#ABCDEF','#000000','#ffffff']){
+   assert.equal((await handle(env,'/api/profile','POST',{name:'Бобур',department:'Аналитика',color},cookie)).status,200);
+   const schedule=await (await handle(env,'/api/schedule?day=2026-09-29','GET',null,cookie)).json();assert.equal(schedule.bookings[0].color,color.toLowerCase());
+  }
+  for(const color of ['red','#123','url(https://evil.test)',null,{},'#123456;'])assert.equal((await handle(env,'/api/profile','POST',{name:'Бобур',department:'Аналитика',color},cookie)).status,400);
+  assert.equal((await (await handle(env,'/api/me','GET',null,cookie)).json()).color,'#ffffff');
+  await db.prepare("INSERT INTO users(id,authorized,name,department) VALUES(43,1,'Коллега','Отдел')").run();
+  const link=await processUpdate(env,{update_id:900,message:{text:'/site',from:{id:43},chat:{id:43,type:'private'}}},NOW);
+  const token=link.reply_markup.inline_keyboard[0][0].url.split('#login=')[1];
+  const other=(await handle(env,'/api/link','POST',{token})).headers.get('set-cookie');
+  await handle(env,'/api/profile','POST',{name:'Коллега',department:'Отдел',color:'#ffffff'},other);
+  assert.equal((await (await handle(env,'/api/me','GET',null,other)).json()).color,'#ffffff');
+  const saved=await db.prepare('SELECT custom_color FROM user_colors WHERE user_id=42').first();assert.equal(saved.custom_color,'#ffffff');
+ }finally{await mf.dispose();}
 });

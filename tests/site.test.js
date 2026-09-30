@@ -73,7 +73,7 @@ test('morning, closing time, and ongoing meetings render correctly',async()=>{
  vm.runInContext("state.now.minute=905;state.bookings=[{id:'ongoing',room_id:5,start_min:840,end_min:960,name:'Имя',department:'Отдел',user_id:42}];renderSchedule()",ctx);
  const meeting=grid.children.find(n=>n.className==='event mine');
  assert.ok(meeting);assert.equal(meeting.style.gridArea,'2 / 2 / span 2 / span 1');
- assert.equal(meeting.children[0].textContent,'14:00–16:00');
+ assert.equal(meeting.children[0].textContent,'14:00–16:00 · Вы');
  meeting.onclick();assert.equal(nodes.get('#detail-dialog').open,true);
  vm.runInContext("state.now.minute=1200;renderSchedule()",ctx);
  assert.equal(grid.children.filter(n=>n.className==='time-cell').length,0);
@@ -87,4 +87,47 @@ test('saving profile immediately reloads the schedule with the new name',async()
  await nodes.get('#profile-form').handlers.submit({preventDefault(){},submitter:new Element('button')});
  assert.equal(vm.runInContext('state.bookings[0].name',ctx),'Новое имя');
  assert.equal(calls.at(-1).path,'/api/schedule?day=2030-12-31');
+});
+
+test('admin history renders full past days, keeps cancellation audit and disables past booking',async()=>{
+ const {ctx,nodes,setResponder}=await harness();
+ const history={day:'2030-12-26',now:{day:'2030-12-31',minute:925},rooms:[{id:5,name:'Комната'}],bookings:[
+  {id:'past',room_id:5,room_name:'Комната',user_id:42,day:'2030-12-26',start_min:480,end_min:540,name:'Имя',department:'Отдел',status:'active',canCancel:false,color:'#123456'},
+  {id:'cancelled',room_id:5,room_name:'Комната',user_id:43,day:'2030-12-26',start_min:480,end_min:540,name:'Коллега',department:'Отдел',status:'cancelled',canCancel:false,cancelled_by:42,color:'#ff0000'}
+ ]};
+ setResponder(async()=>history);
+ vm.runInContext("state.adminOpen=true",ctx);
+ await vm.runInContext("selectAdminDay('2030-12-26')",ctx);
+ assert.equal(nodes.get('#admin-prev-day').disabled,true);
+ nodes.get('#admin-day').value='2030-12-25';nodes.get('#admin-day').onchange();assert.equal(nodes.get('#admin-day').value,'2030-12-26');
+ const grid=nodes.get('#admin-schedule-grid');assert.equal(grid.children.find(n=>n.className==='time-cell').textContent,'08:00');
+ assert.equal(grid.children.filter(n=>n.className==='time-cell').length,24);
+ assert.equal(grid.children.filter(n=>n.className?.startsWith('event')).length,1);
+ assert.ok(grid.children.filter(n=>n.className==='slot').every(n=>n.disabled));
+ assert.equal(nodes.get('#admin-create').hidden,true);
+ const cards=nodes.get('#admin-bookings').children;assert.equal(cards.length,2);assert.ok(cards.every(c=>c.children.length===1));
+ assert.match(cards[1].children[0].children[0].textContent,/Отменена/);
+ const texts=cards[1].children[0].children.map(n=>n.textContent).join(' ');assert.match(texts,/Отменил · Telegram ID: 42/);
+ const event=grid.children.find(n=>n.className?.startsWith('event'));event.onclick();assert.match(nodes.get('#detail-content').textContent,/ID брони: past/);
+});
+test('old admin responses cannot overwrite refreshed history or return after logout',async()=>{
+ const {ctx,nodes,setResponder}=await harness(),pending=[];
+ vm.runInContext('state.adminOpen=true',ctx);
+ setResponder(()=>new Promise(resolve=>pending.push(resolve)));
+ const first=vm.runInContext('loadAdminBookings()',ctx),second=vm.runInContext('loadAdminBookings()',ctx);
+ const data={rooms:[{id:5,name:'Новая'}],now:{day:'2030-12-31',minute:925},bookings:[]};
+ pending[1](data);await second;pending[0]({...data,rooms:[{id:5,name:'Старая'}]});await first;
+ assert.equal(nodes.get('#admin-schedule-grid').children.find(n=>n.className==='room-head').textContent,'Новая');
+ const last=vm.runInContext('loadAdminBookings()',ctx);vm.runInContext('state.adminOpen=false;adminRequest++',ctx);
+ pending[2](data);await last;assert.equal(nodes.get('#admin-schedule-grid').children.length,0);
+});
+test('per-user colors work for own and other bookings, with readable black and white choices',async()=>{
+ const {ctx,nodes}=await harness();
+ vm.runInContext("state.bookings=[{room_id:5,start_min:600,end_min:630,name:'Имя',department:'Отдел',user_id:42,color:'#000000'},{room_id:5,start_min:630,end_min:660,name:'Коллега',department:'Отдел',user_id:43,color:'#ffffff'}];renderSchedule()",ctx);
+ const events=nodes.get('#schedule-grid').children.filter(n=>n.className?.startsWith('event'));
+ assert.deepEqual(events.map(n=>n.style.borderColor),['#000000','#ffffff']);
+ assert.deepEqual(events.map(n=>n.style.backgroundColor),['rgb(217,217,217)','rgb(255,255,255)']);
+ assert.ok(events.every(n=>n.style.color==='#232323'));
+ nodes.get('#profile-color').value='#ff0000';nodes.get('#profile-color').handlers.input();
+ assert.equal(nodes.get('#profile-color-preview').style.borderColor,'#ff0000');
 });

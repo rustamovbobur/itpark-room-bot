@@ -1,5 +1,6 @@
+import {userColor,colorBookings,validColor} from './colors.js';
 import {stmt,menu} from './bot.js';
-import {localNow,validDay,validRange,config} from './time.js';
+import {localNow,validDay,validRange,config,addDays} from './time.js';
 
 const encoder=new TextEncoder();
 const hash=async value=>Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256',encoder.encode(value)))).map(b=>b.toString(16).padStart(2,'0')).join('');
@@ -174,10 +175,13 @@ export async function web(request,env,clock=new Date(),context,menuDelayMs=3500)
       return ok({users});
     }
     if(url.pathname==='/api/admin/bookings'&&method==='GET'){
-      const day=url.searchParams.get('day');if(!validDay(day,now,cfg.horizon))return error(400,'Дата вне доступного периода.');
-      const bookings=(await stmt(db,`SELECT b.id,b.room_id,r.name AS room_name,b.day,b.start_min,b.end_min,b.name,b.department,b.comment,b.user_id,b.created_by
-        FROM bookings b JOIN rooms r ON r.id=b.room_id WHERE b.day=? AND b.status='active' ORDER BY b.room_id,b.start_min`,day).all()).results;
-      return ok({bookings});
+      const day=url.searchParams.get('day');
+      if(!validDay(day,{...now,day:addDays(now.day,-5)},cfg.horizon+5))return error(400,'Доступна история за последние 5 дней и будущие даты.');
+      const rooms=(await db.prepare('SELECT id,name FROM rooms ORDER BY id').all()).results;
+      const rows=(await stmt(db,`SELECT b.id,b.room_id,r.name AS room_name,b.day,b.start_min,b.end_min,b.name,b.department,b.comment,b.user_id,b.created_by,b.status,b.cancelled_by,b.cancelled_at
+        FROM bookings b JOIN rooms r ON r.id=b.room_id WHERE b.day=? ORDER BY b.room_id,b.start_min,b.created_at,b.id`,day).all()).results;
+      const bookings=(await colorBookings(db,rows)).map(row=>({...row,canCancel:row.status==='active'&&(row.day>now.day||(row.day===now.day&&row.end_min>now.minute))}));
+      return ok({day,rooms,bookings,now});
     }
     if(url.pathname==='/api/admin/book'&&method==='POST'){
       let body;try{body=await readJson(request);}catch{return error(400,'Проверьте данные брони.');}
@@ -202,7 +206,7 @@ export async function web(request,env,clock=new Date(),context,menuDelayMs=3500)
     }
     return error(404,'Страница не найдена.');
   }
-  if(url.pathname==='/api/me'&&method==='GET')return ok({id:session.id,name:session.name,department:session.department,adminEligible:adminListed(env,session.id),day:now.day,open:cfg.open,close:cfg.close,horizon:cfg.horizon,maxDuration:cfg.maxDuration});
+  if(url.pathname==='/api/me'&&method==='GET')return ok({id:session.id,name:session.name,department:session.department,color:await userColor(db,session.id),adminEligible:adminListed(env,session.id),day:now.day,open:cfg.open,close:cfg.close,horizon:cfg.horizon,maxDuration:cfg.maxDuration});
   if(url.pathname==='/api/logout'&&method==='POST'){
     await stmt(db,'DELETE FROM web_sessions WHERE token_hash=?',await hash(token)).run();
     await stmt(db,'DELETE FROM web_admin_sessions WHERE user_id=?',session.id).run();
@@ -213,7 +217,7 @@ export async function web(request,env,clock=new Date(),context,menuDelayMs=3500)
     const rooms=(await db.prepare('SELECT id,name FROM rooms WHERE active=1 ORDER BY id').all()).results;
     const bookings=(await stmt(db,`SELECT b.id,b.room_id,b.day,b.start_min,b.end_min,b.name,b.department,b.comment,b.user_id
       FROM bookings b JOIN rooms r ON r.id=b.room_id AND r.active=1 WHERE b.day=? AND b.status='active' ORDER BY b.room_id,b.start_min`,day).all()).results;
-    return ok({day,rooms,bookings,now});
+    return ok({day,rooms,bookings:await colorBookings(db,bookings),now});
   }
   if(url.pathname==='/api/mine'&&method==='GET'){
     const bookings=(await stmt(db,`SELECT b.id,b.room_id,r.name AS room_name,b.day,b.start_min,b.end_min,b.comment FROM bookings b JOIN rooms r ON r.id=b.room_id
@@ -224,13 +228,16 @@ export async function web(request,env,clock=new Date(),context,menuDelayMs=3500)
     let body;try{body=await readJson(request);}catch{return error(400,'Проверьте введённые данные.');}
     const name=sanitize(body.name,80),department=sanitize(body.department,100);
     if(name.length<2||name.length>80||department.length<2||department.length>100)return error(400,'Имя и отдел: минимум 2 символа; максимум 80 и 100 соответственно.');
+    if(body.color!==undefined&&!validColor(body.color))return error(400,'Выберите цвет в формате #RRGGBB.');
+    await userColor(db,session.id);
     await db.batch([
       stmt(db,'UPDATE users SET name=?,department=?,version=version+1 WHERE id=? AND authorized=1',name,department,session.id),
       db.prepare('INSERT INTO state_guard(ok) VALUES(changes())'),
       db.prepare('DELETE FROM state_guard'),
-      stmt(db,`UPDATE bookings SET name=?,department=? WHERE user_id=? AND status='active' AND (day>? OR (day=? AND end_min>?))`,name,department,session.id,now.day,now.day,now.minute)
+      stmt(db,`UPDATE bookings SET name=?,department=? WHERE user_id=? AND status='active' AND (day>? OR (day=? AND end_min>?))`,name,department,session.id,now.day,now.day,now.minute),
+      ...(body.color!==undefined?[stmt(db,'UPDATE user_colors SET custom_color=? WHERE user_id=?',body.color.toLowerCase(),session.id)]:[])
     ]);
-    return ok({name,department});
+    return ok({name,department,color:await userColor(db,session.id)});
   }
   if(url.pathname==='/api/book'&&method==='POST'){
     let body;try{body=await readJson(request);}catch{return error(400,'Проверьте введённые данные.');}

@@ -17,7 +17,7 @@ export default {
   async fetch(request,env,ctx) {
     const url=new URL(request.url);
     if(url.pathname==='/health'&&request.method==='GET') {
-      try {await env.DB.prepare('SELECT r.id,b.created_by,s.token_hash,c.code_hash,l.token_hash,a.token_hash,t.source_hash,q.source_hash,p.code_hash,v.source_hash FROM rooms r,bookings b,web_sessions s,web_codes c,web_links l,web_admin_sessions a,web_admin_attempts t,web_code_requests q,web_signups p,web_login_attempts v WHERE 0').all();return Response.json({ok:true});}
+      try {await env.DB.prepare('SELECT r.id,b.created_by,s.token_hash,c.code_hash,l.token_hash,a.token_hash,t.source_hash,q.source_hash,p.code_hash,v.source_hash,uc.initial_color FROM rooms r,bookings b,web_sessions s,web_codes c,web_links l,web_admin_sessions a,web_admin_attempts t,web_code_requests q,web_signups p,web_login_attempts v,user_colors uc WHERE 0').all();return Response.json({ok:true});}
       catch {return Response.json({ok:false},{status:503});}
     }
     if(url.pathname==='/' && request.method==='GET')return new Response(html,{headers:{'content-type':'text/html; charset=utf-8','cache-control':'no-store','x-content-type-options':'nosniff','content-security-policy':"default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'self'; frame-ancestors 'none'"}});
