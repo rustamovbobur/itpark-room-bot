@@ -14,7 +14,7 @@ async function telegram(env, method, payload) {
   return data.result;
 }
 export default {
-  async fetch(request,env) {
+  async fetch(request,env,ctx) {
     const url=new URL(request.url);
     if(url.pathname==='/health'&&request.method==='GET') {
       try {await env.DB.prepare('SELECT r.id,b.created_by,s.token_hash,c.code_hash,l.token_hash,a.token_hash,t.source_hash,q.source_hash,p.code_hash,v.source_hash FROM rooms r,bookings b,web_sessions s,web_codes c,web_links l,web_admin_sessions a,web_admin_attempts t,web_code_requests q,web_signups p,web_login_attempts v WHERE 0').all();return Response.json({ok:true});}
@@ -25,7 +25,7 @@ export default {
     if(url.pathname==='/site.css'&&request.method==='GET')return new Response(css,{headers:{'content-type':'text/css; charset=utf-8','cache-control':'no-cache','x-content-type-options':'nosniff'}});
     if(url.pathname==='/site.js'&&request.method==='GET')return new Response(client,{headers:{'content-type':'application/javascript; charset=utf-8','cache-control':'no-cache','x-content-type-options':'nosniff'}});
     if(url.pathname==='/brand.png'&&request.method==='GET')return new Response(Uint8Array.from(atob(logoBase64),c=>c.charCodeAt(0)),{headers:{'content-type':'image/png','cache-control':'public, max-age=86400','x-content-type-options':'nosniff'}});
-    if(url.pathname.startsWith('/api/')){try{return await web(request,env);}catch{return Response.json({error:'Сервис временно недоступен. Повторите попытку позже.'},{status:503,headers:{'cache-control':'no-store'}});}}
+    if(url.pathname.startsWith('/api/')){try{return await web(request,env,new Date(),ctx);}catch{return Response.json({error:'Сервис временно недоступен. Повторите попытку позже.'},{status:503,headers:{'cache-control':'no-store'}});}}
     if(url.pathname!=='/webhook'||request.method!=='POST') return new Response('Not found',{status:404});
     if(!env.WEBHOOK_SECRET||request.headers.get('X-Telegram-Bot-Api-Secret-Token')!==env.WEBHOOK_SECRET) return new Response('Forbidden',{status:403});
     if(!env.BOT_TOKEN||!env.STAFF_ACCESS_CODE) return new Response('Not configured',{status:503});

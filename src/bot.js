@@ -1,7 +1,7 @@
 import {localNow, addDays, validDay, validRange, config, time, date} from './time.js';
 const button = (text, callback_data) => ({text, callback_data});
 const grid = (items, width=3) => Array.from({length:Math.ceil(items.length/width)},(_,i)=>items.slice(i*width,(i+1)*width));
-const menu = () => [
+export const menu = () => [
   [button('📅 Забронировать','menu:new'),button('🗓 Расписание','menu:schedule')],
   [button('📋 Мои брони','menu:mine:0'),button('👤 Мой профиль','menu:profile')],
   [button('❓ Помощь','menu:help')]
@@ -223,6 +223,7 @@ export async function plan(env, user, update, nowDate = new Date()) {
     const value=clean(text),limit=state.step==='edit_name'?80:100;
     if(value.length<2||value.length>limit)return reply(`Введите от 2 до ${limit} символов.`,[home]);
     if(state.step==='edit_name')name=value;else department=value;
+    mutations.push(stmt(db,`UPDATE bookings SET name=?,department=? WHERE user_id=? AND status='active' AND (day>? OR (day=? AND end_min>?))`,name,department,user.id,now.day,now.day,now.minute));
     return profile();
   }
   if(text==='/start'||text==='/menu'||text==='/cancel'||cb==='menu:home') return main();

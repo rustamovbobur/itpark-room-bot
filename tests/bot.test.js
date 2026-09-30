@@ -26,12 +26,13 @@ async function prepare(env,id,{room=5,day=DAY,start=600,end=660}={}){await send(
 async function book(env,id,opts){await prepare(env,id,opts);return click(env,id,'confirm');}
 const rows=(env,sql)=>env.DB.sql.prepare(sql).all();
 
-test('Russian onboarding, optional comment, booking and profile snapshot',async()=>{
+test('Russian onboarding, optional comment, booking and profile updates keep active reservations under one name',async()=>{
  const env=setup(); await register(env,1); const response=await book(env,1);
  assert.match(response.text,/забронирована/);const b=rows(env,'SELECT * FROM bookings')[0];
  assert.equal(b.name,'Сотрудник 1');assert.equal(b.department,'Отдел аналитики');assert.equal(b.comment,'');
  assert.equal(rows(env,'SELECT * FROM booking_slots').length,2);
- await send(env,1,'/profile');await click(env,1,'edit_name');await send(env,1,'Новое Имя');await click(env,1,'edit_department');await send(env,1,'Другой отдел');assert.equal(rows(env,'SELECT name FROM bookings')[0].name,'Сотрудник 1');
+ await send(env,1,'/profile');await click(env,1,'edit_name');await send(env,1,'Новое Имя');await click(env,1,'edit_department');await send(env,1,'Другой отдел');
+ const renamed=rows(env,'SELECT name,department FROM bookings')[0];assert.deepEqual([renamed.name,renamed.department],['Новое Имя','Другой отдел']);
 });
 test('schedule keeps its mode when selecting another day',async()=>{
  const env=setup();await register(env,1);

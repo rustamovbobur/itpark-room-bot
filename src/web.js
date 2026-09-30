@@ -1,4 +1,4 @@
-import {stmt} from './bot.js';
+import {stmt,menu} from './bot.js';
 import {localNow,validDay,validRange,config} from './time.js';
 
 const encoder=new TextEncoder();
@@ -23,7 +23,22 @@ const readJson=async request=>{
 };
 const ipKey=async request=>hash(request.headers.get('cf-connecting-ip')||'unknown');
 
-export async function web(request,env,clock=new Date()){
+export function scheduleTelegramMenu(env,userId,context,delayMs=3500){
+  if(!context?.waitUntil||!env.BOT_TOKEN)return;
+  const task=(async()=>{
+    if(delayMs>0)await new Promise(resolve=>setTimeout(resolve,delayMs));
+    try{
+      const response=await fetch(`https://api.telegram.org/bot${env.BOT_TOKEN}/sendMessage`,{
+        method:'POST',headers:{'content-type':'application/json'},
+        body:JSON.stringify({chat_id:userId,text:'✅ Вы вошли в Meeting Rooms через сайт. Бот тоже готов помочь — выберите действие:',reply_markup:{inline_keyboard:menu()}}),signal:AbortSignal.timeout(12000)
+      });
+    if(!response.ok||!(await response.json()).ok)console.warn('Telegram site menu was not delivered.');
+    }catch{console.warn('Telegram site menu was not delivered.');}
+  })();
+  context.waitUntil(task.catch(()=>{}));
+}
+
+export async function web(request,env,clock=new Date(),context,menuDelayMs=3500){
   const url=new URL(request.url),method=request.method,db=env.DB,epoch=Math.floor(clock.getTime()/1000),now=localNow(clock),cfg=config(env);
   if(method==='POST' && request.headers.get('origin')!==url.origin)return error(403,'Обновите страницу и попробуйте ещё раз.');
   if(url.pathname==='/api/link'&&method==='POST'){
@@ -54,6 +69,7 @@ export async function web(request,env,clock=new Date()){
         ...(!registered?[stmt(db,`UPDATE users SET authorized=1,name=?,department=?,version=version+1,state='{"step":"home"}' WHERE id=? AND (authorized=0 OR length(name)=0 OR length(department)=0)`,name,department,link.user_id)]:[]),
         stmt(db,'INSERT INTO web_sessions(token_hash,user_id,expires_at,created_at) VALUES(?,?,?,?)',tokenHash,link.user_id,epoch+30*86400,epoch)
       ]);
+      scheduleTelegramMenu(env,link.user_id,context,menuDelayMs);
       return ok({ok:true},200,{'set-cookie':cookie(token,30*86400)});
     }catch{return error(401,'Ссылка уже использована. Отправьте боту /site ещё раз.');}
   }
@@ -172,7 +188,7 @@ export async function web(request,env,clock=new Date()){
       if(!owner||!room)return error(400,'Сотрудник или комната недоступны.');
       try{
         await stmt(db,`INSERT INTO bookings(id,user_id,room_id,day,start_min,end_min,name,department,comment,created_at,created_by)
-          VALUES(?,?,?,?,?,?,?,?,?,?,?)`,crypto.randomUUID(),owner.id,roomId,day,start,end,owner.name,owner.department,comment,epoch,session.id).run();
+          SELECT ?,id,?,?,?,?,name,department,?,?,? FROM users WHERE id=?`,crypto.randomUUID(),roomId,day,start,end,comment,epoch,session.id,owner.id).run();
         return ok({ok:true},201);
       }catch(e){if(/booking_slots|UNIQUE|constraint/i.test(String(e.message)))return error(409,'Это время уже занято. Обновите расписание.');throw e;}
     }
@@ -197,7 +213,7 @@ export async function web(request,env,clock=new Date()){
     const rooms=(await db.prepare('SELECT id,name FROM rooms WHERE active=1 ORDER BY id').all()).results;
     const bookings=(await stmt(db,`SELECT b.id,b.room_id,b.day,b.start_min,b.end_min,b.name,b.department,b.comment,b.user_id
       FROM bookings b JOIN rooms r ON r.id=b.room_id AND r.active=1 WHERE b.day=? AND b.status='active' ORDER BY b.room_id,b.start_min`,day).all()).results;
-    return ok({day,rooms,bookings});
+    return ok({day,rooms,bookings,now});
   }
   if(url.pathname==='/api/mine'&&method==='GET'){
     const bookings=(await stmt(db,`SELECT b.id,b.room_id,r.name AS room_name,b.day,b.start_min,b.end_min,b.comment FROM bookings b JOIN rooms r ON r.id=b.room_id
@@ -208,7 +224,12 @@ export async function web(request,env,clock=new Date()){
     let body;try{body=await readJson(request);}catch{return error(400,'Проверьте введённые данные.');}
     const name=sanitize(body.name,80),department=sanitize(body.department,100);
     if(name.length<2||name.length>80||department.length<2||department.length>100)return error(400,'Имя и отдел: минимум 2 символа; максимум 80 и 100 соответственно.');
-    await stmt(db,'UPDATE users SET name=?,department=?,version=version+1 WHERE id=? AND authorized=1',name,department,session.id).run();
+    await db.batch([
+      stmt(db,'UPDATE users SET name=?,department=?,version=version+1 WHERE id=? AND authorized=1',name,department,session.id),
+      db.prepare('INSERT INTO state_guard(ok) VALUES(changes())'),
+      db.prepare('DELETE FROM state_guard'),
+      stmt(db,`UPDATE bookings SET name=?,department=? WHERE user_id=? AND status='active' AND (day>? OR (day=? AND end_min>?))`,name,department,session.id,now.day,now.day,now.minute)
+    ]);
     return ok({name,department});
   }
   if(url.pathname==='/api/book'&&method==='POST'){
@@ -218,7 +239,7 @@ export async function web(request,env,clock=new Date()){
     const room=await stmt(db,'SELECT id FROM rooms WHERE id=? AND active=1',roomId).first();if(!room)return error(400,'Комната недоступна.');
     try{
       await stmt(db,`INSERT INTO bookings(id,user_id,room_id,day,start_min,end_min,name,department,comment,created_at)
-        VALUES(?,?,?,?,?,?,?,?,?,?)`,crypto.randomUUID(),session.id,roomId,day,start,end,session.name,session.department,comment,epoch).run();
+        SELECT ?,id,?,?,?,?,name,department,?,? FROM users WHERE id=?`,crypto.randomUUID(),roomId,day,start,end,comment,epoch,session.id).run();
       return ok({ok:true},201);
     }catch(e){if(/booking_slots|UNIQUE|constraint/i.test(String(e.message)))return error(409,'Это время уже заняли. Расписание обновлено.');throw e;}
   }

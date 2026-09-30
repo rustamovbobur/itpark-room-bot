@@ -139,12 +139,32 @@ test('website admin requires allowlisted Telegram identity and passcode; books f
 test('site updates profile and rejects cross-origin writes or dates outside horizon',async()=>{
  const {mf,db,env}=await setup();try{
   const code=await loginCode(env),cookie=(await handle(env,'/api/login','POST',{code})).headers.get('set-cookie');
+  await db.prepare(`INSERT INTO bookings(id,user_id,room_id,day,start_min,end_min,name,department,created_at)
+    VALUES('profile-test',42,5,'2026-09-29',600,630,'Бобур','Аналитика',1)`).run();
   assert.equal((await handle(env,'/api/profile','POST',{name:'Новый Бобур',department:'Инвестиции'},cookie)).status,200);
   assert.equal((await db.prepare('SELECT name FROM users WHERE id=42').first()).name,'Новый Бобур');
+  assert.deepEqual(await db.prepare("SELECT name,department FROM bookings WHERE id='profile-test'").first(),{name:'Новый Бобур',department:'Инвестиции'});
   assert.equal((await handle(env,'/api/book','POST',{roomId:5,day:'2026-09-29',start:600,end:630},cookie,NOW,'https://evil.example')).status,403);
   assert.equal((await handle(env,'/api/book','POST',{roomId:5,day:'2026-12-29',start:600,end:630},cookie)).status,400);
   assert.equal((await handle(env,'/api/schedule?day=2026-09-29','GET',null,cookie)).status,200);
  }finally{await mf.dispose();}
+});
+test('opening the site sends the Telegram main menu after a successful link login',async()=>{
+ const {mf,env}=await setup(),original=globalThis.fetch,pending=[],sent=[];
+ globalThis.fetch=async(url,options)=>{sent.push({url:String(url),body:JSON.parse(options.body)});return Response.json({ok:true});};
+ try{
+  const result=await processUpdate(env,{update_id:202,message:{text:'/site',from:{id:42},chat:{id:42,type:'private'}}},NOW);
+  const token=result.reply_markup.inline_keyboard[0][0].url.match(/#login=([a-f0-9]{64})$/)[1];
+  const context={waitUntil(promise){pending.push(promise);}};
+  const response=await web(req('/api/link','POST',{token}),env,NOW,context,0);
+  assert.equal(response.status,200);await Promise.all(pending);
+  assert.match(sent[0].url,/api\.telegram\.org\/bottest\/sendMessage/);
+  assert.equal(sent[0].body.chat_id,42);
+  assert.match(sent[0].body.text,/Бот тоже готов помочь/);
+  assert.deepEqual(sent[0].body.reply_markup.inline_keyboard[0].map(x=>x.callback_data),['menu:new','menu:schedule']);
+  assert.equal((await web(req('/api/link','POST',{token}),env,NOW,context,0)).status,401);
+  assert.equal(pending.length,1);assert.equal(sent.length,1);
+ }finally{globalThis.fetch=original;await mf.dispose();}
 });
 test('worker serves an actual booking app, without injecting user values into HTML',async()=>{
  const {mf,env}=await setup();try{
@@ -220,4 +240,27 @@ test('API failures return safe JSON, and readiness detects incomplete schema',as
  assert.equal((await worker.fetch(req('/health'),broken)).status,503);
  const result=await worker.fetch(req('/api/me','GET',null,'itpark_session='+'a'.repeat(64)),broken);
  assert.equal(result.status,503);assert.doesNotMatch(await result.text(),/credentials/);
+});
+
+test('profile change during normal or admin booking cannot insert an old name',async()=>{
+ for(const admin of [false,true]){
+  const {mf,db,env}=await setup();try{
+   const code=await loginCode(env),cookie=(await handle(env,'/api/login','POST',{code})).headers.get('set-cookie');
+   const adminToken=admin?(await handle(env,'/api/admin/login','POST',{passcode:env.ADMIN_PASSCODE},cookie)).headers.get('set-cookie'):'';
+   const combined=admin?cookie.split(';')[0]+'; '+adminToken.split(';')[0]:cookie;
+   let intercepted=false;
+   const racingEnv={...env,DB:{prepare(sql){
+    if(!sql.includes('INSERT INTO bookings'))return db.prepare(sql);
+    return {bind(...args){const bound=db.prepare(sql).bind(...args);return {async run(){
+     intercepted=true;
+     assert.equal((await handle(env,'/api/profile','POST',{name:'Актуальное имя',department:'Актуальный отдел'},cookie)).status,200);
+     return bound.run();
+    }}}};
+   }}};
+   assert.equal((await handle(racingEnv,admin?'/api/admin/book':'/api/book','POST',{userId:42,roomId:5,day:'2026-09-29',start:600,end:630},combined)).status,201);
+   assert.ok(intercepted);
+   const row=await db.prepare('SELECT name,department,user_id FROM bookings').first();
+   assert.deepEqual(row,{name:'Актуальное имя',department:'Актуальный отдел',user_id:42});
+  }finally{await mf.dispose();}
+ }
 });
